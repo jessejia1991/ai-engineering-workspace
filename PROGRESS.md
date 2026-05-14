@@ -161,7 +161,7 @@ The plan in §4 addresses missing items either by building them or explicitly di
 
 ## 4. Work plan — May 14–18
 
-> **Cursor:** §5 Priority 1, first unchecked task = `Write requirements.txt`. Day 3 work + §12 verification fixes committed locally on `main` (not yet pushed; see `git log` for current HEAD).
+> **Cursor:** §6 Priority 2, first task = `models.py — add TaskNode`. P1 hard-blockers (§12 verification + Day 3 commit) are done. **P1 docs and wrap-up (requirements.txt / README / design doc additions / final §5.3 test cases) are intentionally deferred to after P2/P3/P4** so the core thematic feature work gets the bulk of remaining time; we'll backfill docs informed by what actually got built. Before writing P2 code, surface §6.2's "Decision before coding" (single-pass breakdown vs multi-turn conversation).
 >
 > *Update this line as work progresses. Claude Code reads this on every "continue" request to find the next task.*
 
@@ -221,11 +221,14 @@ The walk-through follow-up is live — so **demoability of the end-to-end exampl
 
 - [x] Run §12 end-to-end verification path (review → reflect → second review with non-zero memory injected) — completed 2026-05-14, all 6 steps passed; closed loop demonstrably working (3 findings → 1 after one reflect cycle).
 - [x] Commit Day 3 + verification fixes to `main` — done 2026-05-14: `feat(p1): wire end-to-end memory loop and harden ChromaDB init`. See `git log` for the current HEAD SHA (kept out of this doc so amends don't invalidate it). **Push to origin/main not done — awaits user confirmation.**
-- [ ] Write `requirements.txt` (anthropic / aiosqlite / chromadb / sentence-transformers / click / rich / pydantic / python-dotenv / PyGithub / gitpython)
-- [ ] Write `.gitignore` (`.ai-workspace/`, `__pycache__/`, `venv/`, `.env`)
-- [ ] Write `README.md` (architecture diagram, quickstart, command reference, demo path)
-- [ ] Design doc — add "Tradeoffs and Limitations" section
-- [ ] Design doc — add "Evaluation Against Brief" section mapped to the brief's 7 dimensions
+
+**The five items below are intentionally deferred to wrap-up (after P2/P3/P4 land).** Rationale: core-theme feature work has the highest technical uncertainty and biggest demo payoff. Docs are easier to write after we know what actually shipped. If time runs out, the §12 closed-loop demo + design doc still covers the brief — these five are sharpening, not the floor.
+
+- [ ] (deferred) Write `requirements.txt` (anthropic / aiosqlite / chromadb / sentence-transformers / click / rich / pydantic / python-dotenv / PyGithub / gitpython)
+- [ ] (deferred) Tighten `.gitignore` — `.ai-workspace/chroma_db/` already added 2026-05-14; verify `scan + review + reflect` leaves a clean `git status` (§5.3 test)
+- [ ] (deferred) Write `README.md` (architecture diagram, quickstart, command reference, demo path)
+- [ ] (deferred) Design doc — add "Tradeoffs and Limitations" section
+- [ ] (deferred) Design doc — add "Evaluation Against Brief" section mapped to the brief's 7 dimensions
 
 ### 5.3 Test cases for verification
 
