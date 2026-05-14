@@ -31,13 +31,16 @@ The take-home asks for an AI-powered engineering workspace — a multi-agent sys
 
 The system reviews PRs by running specialized agents in parallel against a diff, surfacing findings to a human in a `reflect` step, and feeding the human's accept/reject decisions back into long-lived memory so subsequent reviews improve. Three architectural ideas matter most:
 
-### 2.1 Three-layer memory (ChromaDB)
+### 2.1 Four-layer memory (ChromaDB)
 
 | Layer | Scope | Grows when | Used at |
 |---|---|---|---|
 | `findings_memory` | per-agent | Any finding saved during a review | Retrieval before each agent runs |
 | `corrections_memory` | global across agents | Human rejects a finding in `reflect` with a reason | Retrieval before each agent runs |
 | `repo_profile` | repo-level | `scan` command | Injected into every prompt |
+| `planning_memory` | repo-level | Each `build` invocation on approve — stores raw requirement, clarify Q&A (if any), final graph summary, and user edits made | Queried inside `planner.py` before the LLM call to inject top-K similar past builds and their resolution patterns |
+
+`planning_memory` is the system's "this user / this repo" reflection layer: every requirement breakdown leaves a trace, and similar future requirements pull these traces forward so the planner asks fewer questions and matches the user's preferred decomposition style over time. This is the build-side counterpart to `corrections_memory`'s review-side learning loop.
 
 Forgetting is by **time decay at retrieval time**, not deletion. Retrieval is **semantic top-K**, not full dump, so memory size doesn't blow up the prompt.
 
@@ -258,9 +261,13 @@ The walk-through follow-up is live — so **demoability of the end-to-end exampl
 - [ ] `database.py` — add `task_graphs` table + CRUD (`save_graph` / `load_graph` / `update_node_status`)
 
 **Breakdown**
-- [ ] New `orchestrator/planner.py` — input: natural-language requirement + repo_profile; output: `TaskGraph`
+- [ ] New `orchestrator/planner.py` — input: natural-language requirement + repo_profile + planning_memory; output: `TaskGraph` or a clarify response
 - [ ] LLM prompt — output must be a DAG (not flat list), with explicit dependency edges
 - [ ] Breakdown must produce typical node mix: frontend, backend, test, migration
+- [ ] **Clarify gate** — planner returns either `{"action": "plan", "graph": {...}}` or `{"action": "clarify", "reason": "too_vague|too_complex|ambiguous_target", "questions": [...], "narrow_options": [...]}`. CLI handles a single follow-up (collect user answers / option pick) and re-invokes planner with the augmented prompt, this time requiring `action == "plan"` (no recursive clarify allowed — guarantees the state machine is bounded).
+- [ ] **`memory/vector_store.py`** — add 4th collection `planning_memory` + helpers `add_plan(plan_id, requirement, clarify_qa, final_graph_summary, user_edits, approved)` and `query_relevant_plans(query_text, top_k=3)`. Same time-decay pattern as the existing three layers.
+- [ ] **planner.py memory injection** — before the LLM call, query `planning_memory` semantically against the new requirement, format top-K hits ("past requirement X → no clarify, 5-node DAG; user split backend by layer") into the prompt context. Goal: similar future requirements need fewer / no clarify rounds.
+- [ ] **`cli/build_cmd.py` reflection write-back** — on approve, capture (raw requirement, clarify Q&A if any, final node count + types, ordered list of user edits made, approved flag) and call `add_plan(...)`. Each approved build becomes a training signal for future builds.
 
 **Human-in-the-loop interaction**
 - [ ] New `cli/build_cmd.py` — interactive `build "<requirement>"`
@@ -302,6 +309,14 @@ The walk-through follow-up is live — so **demoability of the end-to-end exampl
 **Persistence**
 - [ ] Two `build` calls produce two distinct rows in `task_graphs` with unique IDs
 - [ ] Loading a saved graph reconstructs all node attributes and edges intact
+
+**Clarify gate + planning memory** *(new)*
+- [ ] Vague input (e.g., `build "improve the pet form"`) triggers `action: "clarify"` with `reason == "too_vague"` and ≥ 2 concrete questions referencing actual files / dimensions
+- [ ] Concrete input (e.g., `build "add a notes field to Pet entity, frontend + backend"`) goes straight to `action: "plan"` — no clarify round
+- [ ] Complex input (e.g., `build "rewrite auth, migrate to OAuth, add MFA, update all tests"`) triggers `action: "clarify"` with `reason == "too_complex"` and ≥ 2 `narrow_options`; the chosen option proceeds to a plan
+- [ ] After approving a first `build`, the second `build` with a semantically similar requirement (e.g., first = "add notes to Pet", second = "add notes to Visit") shows ≥ 1 hit retrieved from `planning_memory` in the planner prompt (visible via `logs` / debug output) — i.e., the system remembers
+- [ ] If the user edited the first build's DAG (e.g., split backend node by layer), the second build's initial draft reflects that edit pattern (memory closes the loop on user style)
+- [ ] After 1 approved build, `query_relevant_plans()` returns ≥ 1 result with the expected `requirement_summary` metadata; after 0 builds, returns `[]` without crashing
 
 **Advance engine** *(only if implemented)*
 - [ ] Running the advance engine on a 3-node graph (backend → test → frontend) executes them in topological order, never reverses
