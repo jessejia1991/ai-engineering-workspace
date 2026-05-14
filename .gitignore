@@ -1,0 +1,7 @@
+venv/
+.env
+__pycache__/
+*.pyc
+*.db
+reports/
+.ai-workspace/reflection-log.json
