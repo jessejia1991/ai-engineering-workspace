@@ -1,0 +1,21 @@
+# Runtime dependencies for the AI Engineering Workspace.
+# Pinned with `>=` against versions we tested on 2026-05-14
+# (Python 3.12, macOS); future minor-version bumps should be safe.
+
+# LLM API client
+anthropic>=0.102.0
+
+# Storage
+aiosqlite>=0.22.0          # async SQLite for workspace.db
+chromadb>=1.5.9            # 4-layer semantic memory (findings / corrections / repo_profile / planning)
+
+# Data modeling
+pydantic>=2.13.0           # TaskNode, TaskGraph, Contract, AgentFinding, etc.
+
+# CLI + display
+click>=8.3.0
+rich>=15.0.0
+
+# Config + integrations
+python-dotenv>=1.2.0
+PyGithub>=2.9.0            # PR diff + description fetch

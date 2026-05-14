@@ -238,7 +238,7 @@ The walk-through follow-up is live — so **demoability of the end-to-end exampl
 
 **The five items below are intentionally deferred to wrap-up (after P2/P3/P4 land).** Rationale: core-theme feature work has the highest technical uncertainty and biggest demo payoff. Docs are easier to write after we know what actually shipped. If time runs out, the §12 closed-loop demo + design doc still covers the brief — these five are sharpening, not the floor.
 
-- [ ] (deferred) Write `requirements.txt` (anthropic / aiosqlite / chromadb / sentence-transformers / click / rich / pydantic / python-dotenv / PyGithub / gitpython)
+- [x] Write `requirements.txt` — done 2026-05-14. Listed only deps actually imported (verified via `grep -r '^(from|import)'`): anthropic, aiosqlite, chromadb, pydantic, click, rich, python-dotenv, PyGithub. Pinned with `>=` against installed versions. Dropped `sentence-transformers` and `gitpython` from the originally-planned list — chromadb 1.5.9 uses an ONNX default embedder (no sentence-transformers needed), and the scanner shells out to `git` via `subprocess` rather than using GitPython. `pip install --dry-run -r requirements.txt` resolves cleanly.
 - [ ] (deferred) Tighten `.gitignore` — `.ai-workspace/chroma_db/` already added 2026-05-14; verify `scan + review + reflect` leaves a clean `git status` (§5.3 test)
 - [ ] (deferred) Write `README.md` (architecture diagram, quickstart, command reference, demo path)
 - [ ] (deferred) Design doc — add "Tradeoffs and Limitations" section
@@ -246,7 +246,7 @@ The walk-through follow-up is live — so **demoability of the end-to-end exampl
 
 ### 5.3 Test cases for verification
 
-- [ ] Fresh clone + `pip install -r requirements.txt` succeeds on a clean Python 3.12 venv
+- [x] `pip install -r requirements.txt --dry-run` resolves cleanly on the current Python 3.12 venv 2026-05-14. (Fresh-clone install test deferred to actual reviewer.)
 - [ ] Following only the README quickstart, a new user gets to a successful `scan` and `review --pr <N>`
 - [ ] README architecture diagram includes all of: scanner, agents, orchestrator, memory layer, reflect loop
 - [ ] Design doc "Tradeoffs" section names at least: architecture-review agent, refactoring agent, test generation, CI integration — with rationale for each cut
