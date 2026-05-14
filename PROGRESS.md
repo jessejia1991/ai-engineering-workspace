@@ -56,6 +56,14 @@ Every agent returns `(findings, reasoning)` where `reasoning = {codebase_underst
 
 There is no separate eval pipeline. The human's accept/reject in `reflect` IS the evaluation — accepted findings reinforce memory, rejected ones produce corrections that subsequent reviews retrieve semantically.
 
+### 2.5 Plan↔Review contract loop (P4, multi-agent design)
+
+`build "<requirement>"` runs 2–4 expert agents (Security / UIUX / Testing / Performance / Delivery — selected per requirement) **concurrently** against the natural-language requirement. Each expert produces (1) clarify questions, (2) ranked design suggestions, (3) proposed contract criteria tagged with `must_have | should_have | nice_to_have` and an `owner_agent`. A Synthesizer step then bundles all expert outputs into an **Architect Report** — always shown — that the human triages (pick which Qs to answer, which suggestions to accept) before the final TaskGraph + Contract are produced.
+
+`review --pr N` accepts an optional `--graph GRAPH-xyz` and otherwise **auto-matches** the PR description against `planning_memory` via semantic similarity (top-1 if confidence > threshold and unambiguous, else fall back to generic review). When a contract is in scope, each review-side agent receives the criteria it owns and emits a `contract_status` per criterion (`PASS | FAIL | UNVERIFIED` + evidence). The contract panel + per-criterion findings are rendered; `merge_recommendation` is downgraded to `request_changes` if any `must_have` is `FAIL`. PRs with no matching graph (human-authored, hotfixes, out-of-band) go through the existing P1 review flow unchanged — contract is **enhancement, not prerequisite**.
+
+This closes the loop between plan and review: the plan-phase contract is the verifiable specification the review phase validates against, instead of those two phases being independent walls of text.
+
 ---
 
 ## 3. Current implementation status
@@ -164,7 +172,7 @@ The plan in §4 addresses missing items either by building them or explicitly di
 
 ## 4. Work plan — May 14–18
 
-> **Cursor:** Priority 2 is functionally done (chunks 1 + 2 both landed 2026-05-14, closed-loop verified). Remaining P2 items (`Advance engine`, `Merge abstraction`, `Demo example`) are either marked stretch in §4.3 or are walk-through-time scripting. **Next priority: §8 P4 — multi-agent trade-off review (SynthesizerAgent).** P1 docs / wrap-up still deferred to end.
+> **Cursor:** §8 Priority 4 Chunk A first item = `models.py — Criterion / Contract / CriterionStatus + TaskGraph.contract + AgentFinding.criterion_id`. P4 redesigned 2026-05-14 from the original SynthesizerAgent trade-off matrix into a **multi-agent contract architecture** that closes the loop between plan and review (see §2.5 + §8). Chunks A → B → C → D, ~1.7 days. P3 stays design-doc only (the multi-expert concurrent wrapper is the de-facto scheduler). P1 docs / wrap-up deferred to end.
 >
 > *Update this line as work progresses. Claude Code reads this on every "continue" request to find the next task.*
 
@@ -202,13 +210,15 @@ A single end-to-end example (e.g., "add a notes field to Pet entity, frontend + 
 
 ### 4.3 Stretch vs commitment
 
-For honesty's sake:
+Updated 2026-05-14 after P2 closed-loop landed and P4 was redesigned in conversation:
 
-- **Confident:** Priority 1, Priority 2 conservative version, Priority 3, Priority 4, Priority 5 design section.
+- **Done:** Priority 1 (review + reflect + memory closed loop) + Priority 2 chunks 1+2 (build with clarify gate + planning_memory closed loop).
+- **In flight:** Priority 4 redesigned as **multi-agent contract architecture** (replacing the original SynthesizerAgent trade-off matrix). Multi-expert plan-phase review + auto-matched contract-aware code review. See §8.
+- **Design-only doc sections:** Priority 3 (scheduler — the multi-expert concurrent wrapper already exercises Semaphore + RLock + timeout patterns informally, so a separate scheduler chunk is doc-only). Priority 5 (multi-engineer collaboration).
 - **Stretch:** Priority 2 full auto-advance engine, Priority 6 Skills.
-- **Fallback if running short:** Priority 4 can degrade to single-conflict demo + design discussion; Priority 3 can drop the cost-cap feature.
+- **Fallback if running short:** Priority 4 can degrade to "expert-plan + contract output but review-side contract consumption stays soft (parse but don't enforce)". This still demonstrates the loop architecturally.
 
-The walk-through follow-up is live — so **demoability of the end-to-end example matters more than feature completeness**. Better to land Priority 2 conservative + 3 + 4 with a clean demo than half-built versions of all six.
+The walk-through follow-up is live — so **demoability of the end-to-end example matters more than feature completeness**. The strongest demo story now: same notes-field requirement runs through expert plan → contract → mock PR → contract-aware review, end-to-end.
 
 ---
 
@@ -385,65 +395,91 @@ The walk-through follow-up is live — so **demoability of the end-to-end exampl
 
 ---
 
-## 8. Priority 4 — Multi-agent trade-off review
+## 8. Priority 4 — Multi-agent contract architecture
+
+**Redesigned 2026-05-14.** Replaces the original SynthesizerAgent + trade-off-matrix scope (kept here as v1 archive at §8.5 for reference). Drives a closed loop between the plan phase and the review phase via a structured **Contract** of verifiable criteria.
 
 ### 8.1 User stories
 
-- A developer reviews a PR where SecurityAgent says "add input validation" and PerformanceAgent says "this code is on the hot path, validation will cost ~15% latency." Instead of two independent findings, the developer sees a single trade-off matrix with options (add validation / don't add / add with caching) and a recommended choice with rationale.
-- The developer picks an option in `reflect`, including notes on why the other options were rejected. The decision feeds into memory.
-- On a second review of the same PR, the SynthesizerAgent surfaces the prior trade-off preference and applies it (or flags that the prior choice is contradicted by new evidence).
+- A developer types `build "add a notes field to Pet entity, both backend and frontend"`. The system runs 4 expert agents (Security / UIUX / Testing / Delivery) **concurrently** against the requirement. They produce ranked design suggestions ("notes must be sanitized for XSS — HIGH", "rollback DROP COLUMN required — HIGH", "char counter when @Size set — MED") and clarify questions where genuinely ambiguous. The developer sees an **Architect Report** (always shown), picks which Qs to answer and which suggestions to accept, and the Synthesizer produces (a) a TaskGraph DAG + (b) a **Contract** of criteria, each tagged with `must_have | should_have | nice_to_have` and an `owner_agent`.
+- A developer running `review --pr 7` (without an explicit `--graph`) sees the system auto-match the PR description against `planning_memory` and surface "Auto-matched PR #7 → GRAPH-ae12d394 (similarity=0.78)". Each review-side agent reports `contract_status` per owned criterion (PASS / FAIL / UNVERIFIED + evidence). A Contract Status panel renders alongside findings; `merge_recommendation` drops to `request_changes` if any `must_have` is `FAIL`.
+- A developer running `review --pr 12` on a hand-written PR that doesn't correspond to any approved graph sees the system fall back gracefully to the P1 generic review flow — no error, no panel, just the existing closed loop. **Contract is enhancement, not prerequisite.**
 
 ### 8.2 Tasks
 
-**SynthesizerAgent**
-- [ ] New `agents/synthesizer.py` — second-pass agent. Input: other agents' findings + reasoning. Output: trade-off matrix.
-- [ ] Prompt design — require conflict identification, cost quantification, default recommendation with rationale
-- [ ] Pydantic schema — `TradeoffDecision`, `TradeoffOption`, `AffectedAgents`
+**Chunk A — Data model (~0.3 day)**
+- [ ] `models.py` — `Criterion` (id, owner_agent, priority ∈ {must_have, should_have, nice_to_have}, category, assertion, rationale, suggested_check ∈ {static-analysis, runtime-test, manual})
+- [ ] `models.py` — `Contract` (contract_id, graph_id, criteria: list[Criterion], created_at)
+- [ ] `models.py` — `TaskGraph.contract: Optional[Contract] = None`
+- [ ] `models.py` — `AgentFinding.criterion_id: Optional[str] = None` (links a finding back to the criterion it addresses)
+- [ ] `models.py` — `CriterionStatus` (criterion_id, status ∈ {PASS, FAIL, UNVERIFIED}, evidence: str)
+- [ ] `database.py` — `task_graphs.contract_json` column; `save_graph` and `load_graph` serialize / parse it (graphs stay self-contained — one row, all info)
+- [ ] `tests/test_models.py` (extend the existing smoke test) — Contract roundtrip, criterion priority enum, contract-status validation
 
-**Conflict detection**
-- [ ] Group flat findings by code location (file + line range)
-- [ ] Same-location, multi-agent → trade-off flow; single-agent → existing accept/reject
-- [ ] Design doc — define exactly what counts as a conflict
+**Chunk B — Multi-expert plan phase (~0.5 day)**
+- [ ] `agents/base.py` — new abstract method `async review_requirement(self, requirement, repo_profile, memory) -> dict` returning `{perspective_summary, clarify_questions, design_suggestions, proposed_criteria}`. Same memory + retry + RLock infra as `review()`.
+- [ ] `agents/{security,uiux,testing,performance}.py` — each implements `review_requirement` with an angle-specific prompt (SecurityAgent asks "what are the attack surfaces / compliance hard-requirements"; UIUXAgent asks "what user impact / accessibility concerns"; TestingAgent asks "what coverage / test strategy"; PerformanceAgent asks "what hot-path concerns").
+- [ ] `agents/delivery.py` (new) — DeliveryAgent focuses on release risk (rollback, schema migration safety, backward compatibility, feature flags). `review_requirement` only at first — no `review()` counterpart yet.
+- [ ] `orchestrator/planner.py` — new function `plan_with_experts(requirement, repo_profile)`. Picks 2–4 experts via `agent_selector_for_plan` (or a per-build LLM call mirroring P1's `select_agents`). Runs them concurrently via `asyncio.gather` + the already-validated RLock pattern. Each expert pulls its own planning_memory (top-K) for its prompt.
 
-**Trade-off display**
-- [ ] `reflect` — detect trade-off matrix findings and render differently (table + highlighted recommendation)
-- [ ] Human choice is now "pick option N", not accept/reject
-- [ ] ChromaDB write-back — correction records "why not the other options" as future trade-off preference memory
+**Chunk C — Synthesizer + Architect Report UX (~0.5 day)**
+- [ ] `orchestrator/planner.py` — `synthesize_report(expert_outputs, requirement, repo_profile) -> ReportPayload` bundles clarify Qs + ranked suggestions + draft contract. Synthesizer is a single LLM call that takes all expert outputs as structured JSON input.
+- [ ] `cli/build_cmd.py` — render Architect Report (always shown after experts complete): Clarify Questions section + Design Suggestions with `★★★ / ★★ / ★` priority stars. Input parser accepts `q1=a q2=b s1 s3` style multi-pick on one line.
+- [ ] `cli/build_cmd.py` — re-invoke planner with selections to produce final `{TaskGraph, Contract}`. Render proposed Graph + Contract panels side-by-side.
+- [ ] `cli/build_cmd.py` — contract editing commands: `ec <criterion_id>` to edit, `dc <criterion_id>` to delete, `nc` to add a criterion manually. Track edits in the existing `edits` list so `planning_memory` reflection covers contract decisions too.
+- [ ] `cli/build_cmd.py` — `add_plan(...)` extended to include contract summary in the document text (so future builds retrieve "this kind of feature usually has 6 must-have criteria, here's the shape").
 
-**Demo**
-- [ ] Construct a PR with a deliberate conflict (e.g., validation slows hot path)
-- [ ] Run full trade-off flow
-- [ ] Second review of same PR — verify Synthesizer retrieves prior trade-off preference
+**Chunk D — Contract-aware review + auto-match (~0.4 day)**
+- [ ] `orchestrator/runner.py` — `run_review` accepts optional `graph_id` parameter; loads contract via `load_graph` if provided.
+- [ ] `orchestrator/runner.py` — new `find_graph_for_pr(pr_description, min_similarity=0.4) -> Optional[dict]` using `query_relevant_plans`. Returns top hit if similarity ≥ threshold AND top1 is clearly ahead of top2 (no ambiguity). Ambiguous matches log all top-3 + similarities and require explicit `--graph`.
+- [ ] `cli/review_cmd.py` — accept `--graph GRAPH-xyz` flag and `--no-graph` (force generic review). Without either, run auto-match.
+- [ ] `orchestrator/agent_selector.py` — when a contract is in scope, **union** the diff-based selection with the set of contract owner agents (a SecurityAgent-owned criterion always selects SecurityAgent, even if the diff didn't trigger it).
+- [ ] `agents/base.py` — `review()` signature extended to accept `owned_criteria: list[Criterion] = []`. Each agent's `build_prompt` includes the criteria block when non-empty. Each agent's parser pulls `contract_status: list[CriterionStatus]` from the reasoning block.
+- [ ] `cli/review_cmd.py` — render Contract Status panel (criteria grouped by `owner_agent`, color-coded by priority, status icon per criterion). `risk_report.merge_recommendation` becomes `request_changes` if any `must_have` is `FAIL`, else preserves existing logic.
+- [ ] `cli/review_cmd.py` — when no contract in scope: zero rendering / zero plumbing, the §12 closed-loop flow runs as today (graceful fallback, not error).
 
 ### 8.3 Test cases for verification
 
-**Conflict identification**
-- [ ] Two agents producing findings on the same `file + line range` triggers the Synthesizer
-- [ ] Two agents producing findings on different lines do NOT trigger the Synthesizer (each goes through standard accept/reject)
-- [ ] An empty findings list does not crash the Synthesizer (returns empty trade-offs)
-- [ ] A single agent's multiple findings on the same line do not trigger the Synthesizer (no conflict to resolve)
+**Multi-expert plan correctness**
+- [ ] `build "add a notes field to Pet entity"` produces a Contract with criteria from ≥ 2 distinct `owner_agent` values
+- [ ] Every criterion has `priority` ∈ {must_have, should_have, nice_to_have}, non-empty `assertion`, non-empty `owner_agent`
+- [ ] The TaskGraph DAG and Contract are saved together on approve (one `task_graphs` row, `contract_json` populated)
+- [ ] Re-loading the graph reconstructs the Contract with all criteria intact
 
-**Trade-off matrix output**
-- [ ] Synthesizer output passes Pydantic validation (no malformed `TradeoffOption` allowed through)
-- [ ] Every trade-off includes at least 2 options
-- [ ] Every trade-off has exactly one `recommended_option_id`
-- [ ] Every option includes the affected agents' positions
+**Architect Report UX**
+- [ ] Report displays after every expert round (even if no clarify questions / all suggestions are nice_to_have) — "always show" property verified
+- [ ] User can answer multiple Qs and accept multiple suggestions on one input line (`q1=a q2=b s1 s3 s5`)
+- [ ] Skipped suggestions do NOT appear as criteria in the final contract
+- [ ] Accepted high-priority suggestions DO appear as `must_have` criteria
 
-**Reflect display**
-- [ ] `reflect` renders trade-off matrices in a different visual style than standard findings (table format)
-- [ ] User input accepts option IDs (1, 2, 3), not y/n
-- [ ] Selecting an option records the choice in `task_findings` with the chosen option captured
-- [ ] User can add a free-text rationale when selecting an option
+**Contract-aware review**
+- [ ] `review --pr N --graph GRAPH-xyz` loads the contract and renders the Contract Status panel
+- [ ] Each criterion is marked PASS / FAIL / UNVERIFIED with an evidence string
+- [ ] At least one `must_have` `FAIL` causes `risk_report.merge_recommendation` to become `request_changes`
+- [ ] All `must_have` PASS and zero high-severity new findings → `merge_recommendation` stays `approve`
+- [ ] Without `--graph` and no auto-match: review behaves identically to P1 (no contract panel, no errors)
 
-**Memory write-back**
-- [ ] Selecting an option writes a correction to ChromaDB tagged as trade-off type
-- [ ] The correction includes both the chosen option AND the rejected options (with reasons)
-- [ ] `get_stats()` shows `corrections_in_memory` increased by 1 per trade-off resolved
+**Auto-match (planning_memory → PR)**
+- [ ] PR with description containing the original requirement text auto-matches to the correct graph at similarity ≥ 0.4
+- [ ] Two approved graphs with similar requirements → ambiguity detected (top1 ≈ top2), top-3 logged, user prompted for explicit `--graph`
+- [ ] PR with description unrelated to any approved graph → no match logged, generic review runs
+- [ ] `--no-graph` flag forces generic review even when auto-match would succeed
 
-**Second review (closed loop)**
-- [ ] Running review on the same PR a second time injects the prior trade-off preference into the Synthesizer's prompt (visible in `execution_log` as memory_injected)
-- [ ] If the new diff matches the old conflict pattern, Synthesizer applies the prior preference (recommendation matches)
-- [ ] If the new diff has different evidence, Synthesizer can override the prior preference (logged explicitly)
+### 8.4 B-track TODOs (deferred, not part of P4 commitment)
+
+These were considered during P4 design conversation and intentionally deferred to keep P4 within ~1.7 days. Each item has a clear use case and isolated scope — pick up in P6 / wrap-up if time remains.
+
+- [ ] `task_graphs.status` lifecycle column (DRAFT / APPROVED_PENDING / UNDER_REVIEW / MERGED / ARCHIVED). Currently all `approved=1` graphs are eligible for auto-match. With status tracking, only `APPROVED_PENDING` and `UNDER_REVIEW` would be searched, avoiding stale matches.
+- [ ] **Contract memory injection** — query past *contracts* (not just plans) when generating new ones. Lets the synthesizer pull "for similar features, SecurityAgent typically contributes a sanitization criterion" patterns. The data is already in `planning_memory` doc text; needs a dedicated retrieval that surfaces criterion-level patterns.
+- [ ] `GRAPH-xxx` slug grep — when the user explicitly writes `Builds GRAPH-xyz` in the PR description, short-circuit semantic match for a deterministic path (cheaper + bulletproof for ops-style workflows). Fall back to semantic match if slug absent.
+
+### 8.5 Original P4 design (archived 2026-05-14)
+
+The pre-redesign P4 was "SynthesizerAgent reads other agents' findings on the same file:line, produces a trade-off matrix, human picks an option, choice persists to corrections_memory." This was a **review-side** synthesis layer, with no plan-side counterpart.
+
+Why we replaced it: it tackled the symptom (conflicting findings) rather than the cause (vague specifications). The contract pattern moves the trade-off decision **forward** into the plan phase, where the decisions are easier to make and the artifact (the contract) becomes a reusable spec for review. Plan↔Review forms a real loop instead of two disconnected pipelines.
+
+If P4 chunks A–D run long, fall back to the §4.3 fallback: keep expert plan + contract output (Chunks A–C), let review consume the contract softly (parse but don't enforce). The loop is still architecturally present, just less strict at the validation gate.
 
 ---
 
