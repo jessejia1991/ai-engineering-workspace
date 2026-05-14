@@ -193,3 +193,8 @@ async def _cmd_logs(task_id: str = None):
 
 if __name__ == "__main__":
     cli()
+
+
+async def _cmd_reflect(task_id: str = None):
+    from cli.reflect_cmd import cmd_reflect
+    await cmd_reflect(task_id)

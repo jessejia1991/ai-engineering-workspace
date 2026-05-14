@@ -22,20 +22,26 @@ class BaseAgent(ABC):
         diff: str,
         file_contents: dict,
         repo_profile: dict,
-        reflection: list,
-    ) -> list[AgentFinding]:
-        prompt = self.build_prompt(task, diff, file_contents, repo_profile, reflection)
+        memory: dict,           # ChromaDB retrieval results
+    ) -> tuple[list[AgentFinding], dict]:
+        """
+        Returns (findings, reasoning).
+        reasoning contains: codebase_understanding, rejected_candidates, confidence.
+        """
+        prompt = self.build_prompt(task, diff, file_contents, repo_profile, memory)
 
         try:
             response = await client.messages.create(
                 model=MODEL,
-                max_tokens=2000,
+                max_tokens=2500,
                 messages=[{"role": "user", "content": prompt}]
             )
             raw = response.content[0].text
-            return self.parse_findings(task.task_id, raw)
+            findings, reasoning = self.parse_response(task.task_id, raw)
+            return findings, reasoning
+
         except Exception as e:
-            return [AgentFinding(
+            error_finding = AgentFinding(
                 finding_id=str(uuid.uuid4())[:8],
                 task_id=task.task_id,
                 agent=self.name,
@@ -46,7 +52,8 @@ class BaseAgent(ABC):
                 suggestion="Check agent logs",
                 status="failed",
                 error=str(e)
-            )]
+            )
+            return [error_finding], {}
 
     @abstractmethod
     def build_prompt(
@@ -55,35 +62,54 @@ class BaseAgent(ABC):
         diff: str,
         file_contents: dict,
         repo_profile: dict,
-        reflection: list,
+        memory: dict,
     ) -> str:
         pass
 
-    def parse_findings(self, task_id: str, raw: str) -> list[AgentFinding]:
+    def parse_response(self, task_id: str, raw: str) -> tuple[list[AgentFinding], dict]:
         """
-        LLM에게 JSON array를 반환하도록 요청.
-        파싱 실패 시 빈 리스트 반환 (pipeline 차단 안 함).
+        Parse LLM response into (findings, reasoning).
+        LLM is asked to return:
+        {
+          "reasoning": { "codebase_understanding": "...", "rejected_candidates": [...], "confidence_per_finding": {...} },
+          "findings": [...]
+        }
+        Falls back to plain array if LLM returns old format.
         """
-        # JSON 블록 추출
         text = raw.strip()
+
+        # Strip markdown code fences
         if "```json" in text:
             text = text.split("```json")[1].split("```")[0].strip()
         elif "```" in text:
             text = text.split("```")[1].split("```")[0].strip()
 
-        # JSON array 찾기
-        start = text.find("[")
-        end = text.rfind("]")
-        if start == -1 or end == -1:
-            return []
+        # Try parsing as object with reasoning + findings
+        reasoning = {}
+        findings_raw = []
 
         try:
-            items = json.loads(text[start:end+1])
+            data = json.loads(text)
+            if isinstance(data, dict):
+                reasoning = data.get("reasoning", {})
+                findings_raw = data.get("findings", [])
+            elif isinstance(data, list):
+                # Fallback: plain array (old format)
+                findings_raw = data
         except json.JSONDecodeError:
-            return []
+            # Try to extract JSON array as last resort
+            start = text.find("[")
+            end = text.rfind("]")
+            if start != -1 and end != -1:
+                try:
+                    findings_raw = json.loads(text[start:end+1])
+                except Exception:
+                    return [], {}
 
         findings = []
-        for item in items:
+        for i, item in enumerate(findings_raw):
+            if not isinstance(item, dict):
+                continue
             try:
                 findings.append(AgentFinding(
                     finding_id=str(uuid.uuid4())[:8],
@@ -100,30 +126,56 @@ class BaseAgent(ABC):
             except Exception:
                 continue
 
-        return findings
+        return findings, reasoning
 
-    def _format_corrections(self, corrections: list) -> str:
-        if not corrections:
-            return "None recorded yet."
-        lines = []
-        for c in corrections[-5:]:  # 최근 5개만
-            lines.append(f"- [{c['type']}] {c['note']}")
-        return "\n".join(lines)
+    def _format_memory(self, memory: dict) -> str:
+        """Format ChromaDB memory for prompt injection."""
+        from memory.vector_store import format_memory_for_prompt
+        return format_memory_for_prompt(memory)
 
-    def _format_reflection(self, reflection: list) -> str:
-        if not reflection:
-            return "No history yet."
-        accepted = [r for r in reflection if r.get("accepted") == 1]
-        rejected = [r for r in reflection if r.get("accepted") == 0]
-        lines = []
-        if accepted:
-            lines.append("Findings this team values:")
-            for r in accepted[-3:]:
-                content = json.loads(r["content"]) if isinstance(r["content"], str) else r["content"]
-                lines.append(f"  + {content.get('title', '')}")
-        if rejected:
-            lines.append("Findings this team rejects (false positives):")
-            for r in rejected[-3:]:
-                content = json.loads(r["content"]) if isinstance(r["content"], str) else r["content"]
-                lines.append(f"  - {content.get('title', '')}")
-        return "\n".join(lines) if lines else "No history yet."
+    def _format_files(self, file_contents: dict) -> str:
+        """Format file contents for prompt."""
+        text = ""
+        for path, content in file_contents.items():
+            text += f"\n### {path}\n```\n{content}\n```\n"
+        return text
+
+    def _reasoning_instructions(self) -> str:
+        """Standard reasoning format instructions appended to every agent prompt."""
+        return """
+## Output format
+Return a JSON object with this exact structure:
+
+{
+  "reasoning": {
+    "codebase_understanding": "Brief description of what you understand about this codebase from the code",
+    "rejected_candidates": [
+      {
+        "issue": "Issue you considered but decided not to report",
+        "why_rejected": "Specific reason — reference the code or memory",
+        "confidence_to_reject": 0.90
+      }
+    ],
+    "confidence_per_finding": {
+      "finding_0": 0.85
+    }
+  },
+  "findings": [
+    {
+      "severity": "low|medium|high|critical",
+      "category": "short-category-string",
+      "title": "One line description",
+      "detail": "Specific explanation referencing actual code",
+      "suggestion": "Concrete fix",
+      "file": "relative/path/to/file.java",
+      "line": 42
+    }
+  ]
+}
+
+Rules:
+- Only report issues with evidence in the actual code
+- If no issues found, return empty findings array
+- Always populate rejected_candidates to show your reasoning
+- Return ONLY the JSON object, no other text
+"""
