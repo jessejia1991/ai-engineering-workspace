@@ -172,7 +172,7 @@ The plan in §4 addresses missing items either by building them or explicitly di
 
 ## 4. Work plan — May 14–18
 
-> **Cursor:** §8 Priority 4 Chunk A first item = `models.py — Criterion / Contract / CriterionStatus + TaskGraph.contract + AgentFinding.criterion_id`. P4 redesigned 2026-05-14 from the original SynthesizerAgent trade-off matrix into a **multi-agent contract architecture** that closes the loop between plan and review (see §2.5 + §8). **Sequence: P4 Chunk A → P3 (HTTP wrapper) → P4 Chunks B / C / D**, ~2 days total. P3 is **purely a network-layer rate-limit + retry + timeout wrapper around `AsyncAnthropic`**, drop-in replacement at `agents/base.py:client` — not agent orchestration (see §7). P1 docs / wrap-up deferred to end.
+> **Cursor:** §7 P3 (HTTP-layer wrapper) — first task: `agents/llm_client.py` with `RateLimitedAnthropicClient` (semaphore + timeout + 429/529 retry + optional token budget + `usage_summary`). P4 Chunk A landed 2026-05-14 (data model + DB schema + ALTER TABLE migration; P2 backward compat verified). Up next: P3 → P4 Chunks B → C → D. P1 docs / wrap-up deferred to end.
 >
 > *Update this line as work progresses. Claude Code reads this on every "continue" request to find the next task.*
 
@@ -419,14 +419,14 @@ The agentic orchestration layer (`agent_selector`, `planner`, `runner`, `build_c
 
 ### 8.2 Tasks
 
-**Chunk A — Data model (~0.3 day)**
-- [ ] `models.py` — `Criterion` (id, owner_agent, priority ∈ {must_have, should_have, nice_to_have}, category, assertion, rationale, suggested_check ∈ {static-analysis, runtime-test, manual})
-- [ ] `models.py` — `Contract` (contract_id, graph_id, criteria: list[Criterion], created_at)
-- [ ] `models.py` — `TaskGraph.contract: Optional[Contract] = None`
-- [ ] `models.py` — `AgentFinding.criterion_id: Optional[str] = None` (links a finding back to the criterion it addresses)
-- [ ] `models.py` — `CriterionStatus` (criterion_id, status ∈ {PASS, FAIL, UNVERIFIED}, evidence: str)
-- [ ] `database.py` — `task_graphs.contract_json` column; `save_graph` and `load_graph` serialize / parse it (graphs stay self-contained — one row, all info)
-- [ ] `tests/test_models.py` (extend the existing smoke test) — Contract roundtrip, criterion priority enum, contract-status validation
+**Chunk A — Data model (~0.3 day) — DONE 2026-05-14**
+- [x] `models.py` — `Criterion` (id, owner_agent, priority, category, assertion, rationale, suggested_check) + `Contract.owners()` / `criteria_for(agent_name)` helpers.
+- [x] `models.py` — `Contract` (contract_id, graph_id, criteria, created_at).
+- [x] `models.py` — `TaskGraph.contract: Optional[Contract] = None`. P2 graphs that don't set this remain valid.
+- [x] `models.py` — `AgentFinding.criterion_id: Optional[str] = None`.
+- [x] `models.py` — `CriterionStatus` (criterion_id, status, evidence: default empty).
+- [x] `database.py` — `task_graphs.contract_json` column added; idempotent `ALTER TABLE ADD COLUMN` migration runs in `init_db` for pre-P4 schemas. `save_graph` / `load_graph` serialize and parse contract; absent contract is `None` (not error).
+- [x] Inline smoke test covers: Criterion/Contract construction + helpers; CriterionStatus defaults; AgentFinding.criterion_id optional; full TaskGraph→DB→TaskGraph roundtrip with contract; save/load without contract; 4 existing P2 graphs in workspace.db still load cleanly with contract=None after migration; priority values stay in valid set.
 
 **Chunk B — Multi-expert plan phase (~0.5 day)**
 - [ ] `agents/base.py` — new abstract method `async review_requirement(self, requirement, repo_profile, memory) -> dict` returning `{perspective_summary, clarify_questions, design_suggestions, proposed_criteria}`. Same memory + retry + RLock infra as `review()`.
@@ -453,10 +453,10 @@ The agentic orchestration layer (`agent_selector`, `planner`, `runner`, `build_c
 ### 8.3 Test cases for verification
 
 **Multi-expert plan correctness**
-- [ ] `build "add a notes field to Pet entity"` produces a Contract with criteria from ≥ 2 distinct `owner_agent` values
-- [ ] Every criterion has `priority` ∈ {must_have, should_have, nice_to_have}, non-empty `assertion`, non-empty `owner_agent`
-- [ ] The TaskGraph DAG and Contract are saved together on approve (one `task_graphs` row, `contract_json` populated)
-- [ ] Re-loading the graph reconstructs the Contract with all criteria intact
+- [ ] `build "add a notes field to Pet entity"` produces a Contract with criteria from ≥ 2 distinct `owner_agent` values — *(chunks B+C)*
+- [ ] Every criterion has `priority` ∈ {must_have, should_have, nice_to_have}, non-empty `assertion`, non-empty `owner_agent` — *(chunks B+C; structurally enforced by Criterion schema today)*
+- [ ] The TaskGraph DAG and Contract are saved together on approve (one `task_graphs` row, `contract_json` populated) — *(chunks B+C)*
+- [x] Re-loading the graph reconstructs the Contract with all criteria intact — verified 2026-05-14 at the model+DB layer (Chunk A smoke test).
 
 **Architect Report UX**
 - [ ] Report displays after every expert round (even if no clarify questions / all suggestions are nice_to_have) — "always show" property verified

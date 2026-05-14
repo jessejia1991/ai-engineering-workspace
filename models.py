@@ -28,6 +28,7 @@ class AgentFinding(BaseModel):
     accepted: Optional[bool] = None
     status: str = "ok"           # ok | failed
     error: Optional[str] = None
+    criterion_id: Optional[str] = None   # links a finding to a Contract Criterion (P4)
 
 
 class RiskReport(BaseModel):
@@ -57,12 +58,46 @@ class TaskNode(BaseModel):
     pr_number: Optional[int] = None
 
 
+# ---------- P4: contract data model ----------
+
+class Criterion(BaseModel):
+    id: str                       # e.g. "c1", "c2"
+    owner_agent: str              # SecurityAgent | UIUXAgent | TestingAgent | PerformanceAgent | DeliveryAgent
+    priority: str                 # must_have | should_have | nice_to_have
+    category: str                 # short tag, e.g. "input-validation"
+    assertion: str                # the testable statement
+    rationale: str                # one-sentence "why this matters"
+    suggested_check: str = "manual"  # static-analysis | runtime-test | manual
+
+
+class Contract(BaseModel):
+    contract_id: str
+    graph_id: str
+    criteria: list[Criterion] = []
+    created_at: Optional[str] = None
+
+    def owners(self) -> set[str]:
+        return {c.owner_agent for c in self.criteria}
+
+    def criteria_for(self, agent_name: str) -> list[Criterion]:
+        return [c for c in self.criteria if c.owner_agent == agent_name]
+
+
+class CriterionStatus(BaseModel):
+    """A review-side agent's verdict on one Criterion. Returned in the
+    reasoning payload of agent_result events."""
+    criterion_id: str
+    status: str                   # PASS | FAIL | UNVERIFIED
+    evidence: str = ""            # what the agent looked at to conclude
+
+
 class TaskGraph(BaseModel):
     graph_id: str
     root_requirement: str
     nodes: list[TaskNode] = []
     current_node_id: Optional[str] = None
     created_at: Optional[str] = None
+    contract: Optional[Contract] = None   # P4: bundled spec stored alongside the DAG
 
     @property
     def edges(self) -> list[tuple[str, str]]:

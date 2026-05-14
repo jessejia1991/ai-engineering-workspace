@@ -46,17 +46,28 @@ async def init_db():
         # P2: task graphs from `build <requirement>` breakdown. Whole graph
         # serialized as JSON in `nodes_json` (small, self-contained, easy to
         # version). `approved` distinguishes drafts vs. user-confirmed graphs.
+        # P4: `contract_json` holds the Criterion list produced by the
+        # multi-expert plan phase — null on graphs created before P4 landed
+        # (forward-compatible with old graphs in workspace.db).
         await db.execute("""
             CREATE TABLE IF NOT EXISTS task_graphs (
                 id               TEXT PRIMARY KEY,
                 root_requirement TEXT,
                 nodes_json       TEXT,
+                contract_json    TEXT,
                 current_node_id  TEXT,
                 approved         INTEGER DEFAULT 0,
                 created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Migrate existing schema (column added in P4): silently add the
+        # column if it's missing so workspace.db files written by P2 keep
+        # working without manual migration.
+        try:
+            await db.execute("ALTER TABLE task_graphs ADD COLUMN contract_json TEXT")
+        except Exception:
+            pass  # column already exists
         await db.commit()
 
 
@@ -230,24 +241,30 @@ async def save_graph(graph) -> None:
     """
     Upsert a TaskGraph. Accepts either a Pydantic TaskGraph or a dict shaped
     like one (the CLI may serialize before calling). Whole node list is
-    persisted as JSON in nodes_json — graphs are small and self-contained.
+    persisted as JSON in nodes_json; contract (if any) in contract_json.
+    Graphs are small enough that one row per graph is cheaper than
+    normalized tables.
     """
     if hasattr(graph, "model_dump"):
         data = graph.model_dump()
     else:
         data = dict(graph)
 
-    nodes_json = json.dumps(data.get("nodes", []))
+    nodes_json    = json.dumps(data.get("nodes", []))
+    contract_data = data.get("contract")
+    contract_json = json.dumps(contract_data) if contract_data else None
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
             INSERT INTO task_graphs
-                (id, root_requirement, nodes_json, current_node_id, approved)
-            VALUES (?, ?, ?, ?, ?)
+                (id, root_requirement, nodes_json, contract_json,
+                 current_node_id, approved)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 root_requirement = excluded.root_requirement,
                 nodes_json       = excluded.nodes_json,
+                contract_json    = excluded.contract_json,
                 current_node_id  = excluded.current_node_id,
                 approved         = excluded.approved,
                 updated_at       = CURRENT_TIMESTAMP
@@ -256,6 +273,7 @@ async def save_graph(graph) -> None:
                 data["graph_id"],
                 data.get("root_requirement", ""),
                 nodes_json,
+                contract_json,
                 data.get("current_node_id"),
                 1 if data.get("approved") else 0,
             ),
@@ -265,9 +283,10 @@ async def save_graph(graph) -> None:
 
 async def load_graph(graph_id: str) -> dict | None:
     """
-    Return a graph as a dict (with nodes parsed back from JSON), or None.
-    Returning a dict instead of a TaskGraph avoids a circular import with
-    models.py and keeps database.py free of pydantic — callers reconstruct.
+    Return a graph as a dict (with nodes + contract parsed back from JSON),
+    or None. Returning a dict instead of a TaskGraph avoids a circular
+    import with models.py and keeps database.py free of pydantic —
+    callers reconstruct via TaskGraph(**data).
     """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -282,6 +301,15 @@ async def load_graph(graph_id: str) -> dict | None:
                 d["nodes"] = json.loads(d.pop("nodes_json"))
             except (json.JSONDecodeError, TypeError):
                 d["nodes"] = []
+            # contract is optional and may be missing on pre-P4 rows
+            contract_raw = d.pop("contract_json", None)
+            if contract_raw:
+                try:
+                    d["contract"] = json.loads(contract_raw)
+                except (json.JSONDecodeError, TypeError):
+                    d["contract"] = None
+            else:
+                d["contract"] = None
             d["graph_id"] = d.pop("id")
             d["approved"] = bool(d.get("approved"))
             return d
