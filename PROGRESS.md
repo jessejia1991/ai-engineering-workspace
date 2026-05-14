@@ -172,7 +172,7 @@ The plan in §4 addresses missing items either by building them or explicitly di
 
 ## 4. Work plan — May 14–18
 
-> **Cursor:** §8 Priority 4 Chunk A first item = `models.py — Criterion / Contract / CriterionStatus + TaskGraph.contract + AgentFinding.criterion_id`. P4 redesigned 2026-05-14 from the original SynthesizerAgent trade-off matrix into a **multi-agent contract architecture** that closes the loop between plan and review (see §2.5 + §8). Chunks A → B → C → D, ~1.7 days. P3 stays design-doc only (the multi-expert concurrent wrapper is the de-facto scheduler). P1 docs / wrap-up deferred to end.
+> **Cursor:** §8 Priority 4 Chunk A first item = `models.py — Criterion / Contract / CriterionStatus + TaskGraph.contract + AgentFinding.criterion_id`. P4 redesigned 2026-05-14 from the original SynthesizerAgent trade-off matrix into a **multi-agent contract architecture** that closes the loop between plan and review (see §2.5 + §8). **Sequence: P4 Chunk A → P3 (HTTP wrapper) → P4 Chunks B / C / D**, ~2 days total. P3 is **purely a network-layer rate-limit + retry + timeout wrapper around `AsyncAnthropic`**, drop-in replacement at `agents/base.py:client` — not agent orchestration (see §7). P1 docs / wrap-up deferred to end.
 >
 > *Update this line as work progresses. Claude Code reads this on every "continue" request to find the next task.*
 
@@ -214,7 +214,8 @@ Updated 2026-05-14 after P2 closed-loop landed and P4 was redesigned in conversa
 
 - **Done:** Priority 1 (review + reflect + memory closed loop) + Priority 2 chunks 1+2 (build with clarify gate + planning_memory closed loop).
 - **In flight:** Priority 4 redesigned as **multi-agent contract architecture** (replacing the original SynthesizerAgent trade-off matrix). Multi-expert plan-phase review + auto-matched contract-aware code review. See §8.
-- **Design-only doc sections:** Priority 3 (scheduler — the multi-expert concurrent wrapper already exercises Semaphore + RLock + timeout patterns informally, so a separate scheduler chunk is doc-only). Priority 5 (multi-engineer collaboration).
+- **Implemented at HTTP layer:** Priority 3 (~0.3 day). The user clarified P3 is *purely* a `RateLimitedAnthropicClient` wrapper around `AsyncAnthropic` — semaphore on concurrent in-flight requests, retry on 429/529 with exponential backoff, per-request timeout, optional token budget. **Not** an agent-orchestration layer (planner / selector remain unchanged). Drops in at `agents/base.py` and a shared module-level instance covers `planner.py` + `agent_selector.py` so the limits are session-wide.
+- **Design-only doc sections:** Priority 5 (multi-engineer collaboration).
 - **Stretch:** Priority 2 full auto-advance engine, Priority 6 Skills.
 - **Fallback if running short:** Priority 4 can degrade to "expert-plan + contract output but review-side contract consumption stays soft (parse but don't enforce)". This still demonstrates the loop architecturally.
 
@@ -336,62 +337,73 @@ The walk-through follow-up is live — so **demoability of the end-to-end exampl
 
 ---
 
-## 7. Priority 3 — Agent scheduling layer
+## 7. Priority 3 — HTTP-layer LLM client wrapper
+
+**Scope clarified 2026-05-14.** P3 is *not* an agent-orchestration layer. It is a thin wrapper around `AsyncAnthropic` that drops in transparently at `agents/base.py:client` (and `planner.py`, `agent_selector.py`). All existing call sites — `client.messages.create(...)` — keep working without modification; the wrapper just enforces concurrency / retry / timeout / budget invariants on the underlying HTTP traffic.
+
+The agentic orchestration layer (`agent_selector`, `planner`, `runner`, `build_cmd`) is unaffected and was never the target.
 
 ### 7.1 User stories
 
-- A reviewer running a review on a large diff (20+ files) sees agents queued and dispatched safely — concurrent agents never exceed the configured limit, no single agent hangs forever, and the system reports actual token spend.
-- When an agent times out or hits a rate limit, the reviewer sees a clear log entry instead of a generic Python traceback, and the remaining agents continue to completion.
-- *(Demo moment)* The reviewer can inspect the `logs` output and see queue depth, start time, completion time, and token spend per agent.
+- A reviewer running a review (or a build) sees concurrent HTTP requests stay below the configured cap — no rate-limit cascades, no hung sockets — even when the orchestrator fans out to 4–5 agents at once.
+- When the Anthropic API returns 429 / 529 (rate-limit / overloaded), the wrapper retries with exponential backoff transparently; the agent code never sees the transient failure. After `max_retries` exhausted, it surfaces a clear error.
+- A request that exceeds `request_timeout_s` is killed cleanly; in-flight peers are not affected.
+- At the end of every `review` and `build`, the CLI prints a `usage_summary`: `{requests, input_tokens, output_tokens, retries, timeouts, budget_used / budget_cap}`. This makes the run cost observable per session.
+- Setting `token_budget` raises `BudgetExceeded` before the next request goes out — preventing runaway cost in misconfigured prompts.
 
-### 7.2 Tasks
+### 7.2 Tasks (~0.3 day)
 
-**Core abstraction**
-- [ ] New `orchestrator/scheduler.py` — `AgentScheduler` class replacing `asyncio.gather` in `runner.py`
-- [ ] Semaphore for max concurrent agents (configurable, default 3)
-- [ ] `TokenBudget` tracker — accumulate per-task tokens, warn/reject on overrun
-- [ ] Per-agent timeout (configurable, default 60s)
+**Client implementation**
+- [ ] New `agents/llm_client.py` — `RateLimitedAnthropicClient`
+  - Wraps `AsyncAnthropic` instance internally
+  - `messages` property returns a proxy so `client.messages.create(...)` works identically to the SDK
+  - `asyncio.Semaphore(max_concurrent)` gates concurrent in-flight requests (default 5)
+  - `asyncio.wait_for(..., timeout=request_timeout_s)` per request (default 120s)
+  - Retry on `RateLimitError` / `APIStatusError` 429/529 with exponential backoff: `backoff_base_s * 2**attempt`, max `max_retries` attempts (default 4)
+  - `token_budget`: optional; track `response.usage.input_tokens + output_tokens` per call, raise `BudgetExceeded` before the next request if exceeded
+  - `usage_summary()` returns the accumulated counters
+  - Cancellation-safe: if the caller's task is cancelled, semaphore is released in `finally`
 
-**Safety**
-- [ ] Failure isolation — one agent crash does not block others (partial today; verify)
-- [ ] Rate-limit handling — backoff-retry vs give-up logic on Anthropic 429
-- [ ] Cost cap — total cost ceiling per review, abort early if exceeded
+**Wire-in**
+- [ ] Module-level shared instance in `agents/llm_client.py`: `client = RateLimitedAnthropicClient()` — env-var configurable (`ANTHROPIC_MAX_CONCURRENT`, etc.)
+- [ ] `agents/base.py` — replace `client = AsyncAnthropic()` with `from agents.llm_client import client`
+- [ ] `orchestrator/agent_selector.py` — same replacement
+- [ ] `orchestrator/planner.py` — same replacement
+- [ ] All three modules now share one semaphore + one token budget per session
 
 **Observability**
-- [ ] `execution_log` — add event types: `agent_queued` / `agent_started` / `agent_timeout` / `budget_exceeded`
-- [ ] `logs` command — render these events
-- [ ] Design doc — explain how this layer keeps large diffs safe
-
-**Validation**
-- [ ] Use Priority 2's end-to-end example. Inject a deliberately-slow node to trigger timeout.
+- [ ] `cli/review_cmd.py` — print `usage_summary` at end of run (dim panel below Risk Report)
+- [ ] `cli/build_cmd.py` — print `usage_summary` at end of run (after the saved-graph panel)
 
 ### 7.3 Test cases for verification
 
-**Concurrency limits**
-- [ ] With semaphore = 2 and 5 agents to run, at most 2 are in `agent_started` state without a corresponding `agent_result` at any moment in the execution log
-- [ ] All 5 agents eventually reach `agent_result` (none stuck in queue forever)
+**Concurrency cap**
+- [ ] With `max_concurrent=2` and 5 simultaneously-launched `messages.create(...)` calls, at most 2 are in-flight at any single instant (measure via a counter inside the wrapper)
+- [ ] All 5 calls eventually complete; none stuck
 
 **Timeout**
-- [ ] An agent that sleeps longer than the configured timeout gets killed and an `agent_timeout` event is logged
-- [ ] After a timeout, the remaining agents complete normally
-- [ ] A timed-out agent does not corrupt `task_findings` (no partial finding rows)
+- [ ] A call mocked to hang past `request_timeout_s` raises `TimeoutError` (or `asyncio.TimeoutError`) at the wrapper level — does not propagate as a generic stuck future
+- [ ] Other in-flight calls continue and complete normally after one peer times out
+- [ ] A timed-out call releases its semaphore slot (verifiable by launching a 6th call right after)
+
+**Retry on rate limit**
+- [ ] A mocked 429 response is retried with exponential backoff (verify total wallclock ≥ `backoff_base_s * (1+2+4)` for 3 retries)
+- [ ] After `max_retries` consecutive 429s the call raises a clear `RateLimitError`, not an infinite loop
+- [ ] A 529 (overloaded) is treated the same as 429
 
 **Token budget**
-- [ ] Setting `TokenBudget.max_tokens = 100` and running a review that would consume more aborts with a `budget_exceeded` event
-- [ ] Budget tracking accumulates across agents (not reset between agents within one task)
-- [ ] Within-budget review completes without any `budget_exceeded` event
+- [ ] `token_budget=100` + a request that would consume more raises `BudgetExceeded` *before* sending the request (no wasted call)
+- [ ] Budget accumulates across calls (not reset per call)
+- [ ] Within-budget session completes with `usage_summary.budget_used < budget_cap`
 
-**Rate-limit handling**
-- [ ] A mocked 429 response triggers backoff-retry (logged as `agent_retry`)
-- [ ] After N consecutive 429s, the agent fails cleanly with a clear error finding (no infinite retry loop)
+**Drop-in compatibility**
+- [ ] Existing `agents/base.py` `review()` flow runs unchanged with `client.messages.create(...)` after swap — no signature changes required
+- [ ] An end-to-end `review --pr 1` with the wrapper installed produces the same findings shape as before the swap
+- [ ] An end-to-end `build "..."` with the wrapper installed completes and prints a `usage_summary` line
 
-**Failure isolation**
-- [ ] If `SecurityAgent` raises an unhandled exception, `BugFindingAgent` still runs to completion and its findings appear in `task_findings`
-- [ ] The crashed agent produces an `agent_result` with `status="failed"` and an error message, not a missing row
-
-**Observability**
-- [ ] `logs TASK-PR1` shows the full lifecycle for each agent: `agent_queued` → `agent_started` → `agent_result` (or `agent_timeout` / `agent_retry`)
-- [ ] Each event has a timestamp; the timestamps form a coherent timeline
+**Observability surface**
+- [ ] CLI output at end of `review` shows `usage_summary` with non-zero `requests` and `input_tokens`
+- [ ] CLI output at end of `build` shows the same; `retries` and `timeouts` are 0 on the happy path
 
 ---
 
