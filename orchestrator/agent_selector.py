@@ -1,12 +1,11 @@
 import os
 import json
-from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
+from agents.llm_client import client    # P3: rate-limited HTTP wrapper
 from models import AgentSelection
 
 load_dotenv()
 
-client = AsyncAnthropic()
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 

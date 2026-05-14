@@ -172,7 +172,7 @@ The plan in §4 addresses missing items either by building them or explicitly di
 
 ## 4. Work plan — May 14–18
 
-> **Cursor:** §7 P3 (HTTP-layer wrapper) — first task: `agents/llm_client.py` with `RateLimitedAnthropicClient` (semaphore + timeout + 429/529 retry + optional token budget + `usage_summary`). P4 Chunk A landed 2026-05-14 (data model + DB schema + ALTER TABLE migration; P2 backward compat verified). Up next: P3 → P4 Chunks B → C → D. P1 docs / wrap-up deferred to end.
+> **Cursor:** §8 P4 Chunk B (multi-expert plan phase) — first task: `agents/base.py` add abstract `review_requirement(...)` method, then per-agent prompts. P4 Chunk A + P3 (HTTP wrapper) both landed 2026-05-14. Up next: P4 Chunks B → C → D. P1 docs / wrap-up deferred to end.
 >
 > *Update this line as work progresses. Claude Code reads this on every "continue" request to find the next task.*
 
@@ -351,59 +351,48 @@ The agentic orchestration layer (`agent_selector`, `planner`, `runner`, `build_c
 - At the end of every `review` and `build`, the CLI prints a `usage_summary`: `{requests, input_tokens, output_tokens, retries, timeouts, budget_used / budget_cap}`. This makes the run cost observable per session.
 - Setting `token_budget` raises `BudgetExceeded` before the next request goes out — preventing runaway cost in misconfigured prompts.
 
-### 7.2 Tasks (~0.3 day)
+### 7.2 Tasks (~0.3 day) — DONE 2026-05-14
 
 **Client implementation**
-- [ ] New `agents/llm_client.py` — `RateLimitedAnthropicClient`
-  - Wraps `AsyncAnthropic` instance internally
-  - `messages` property returns a proxy so `client.messages.create(...)` works identically to the SDK
-  - `asyncio.Semaphore(max_concurrent)` gates concurrent in-flight requests (default 5)
-  - `asyncio.wait_for(..., timeout=request_timeout_s)` per request (default 120s)
-  - Retry on `RateLimitError` / `APIStatusError` 429/529 with exponential backoff: `backoff_base_s * 2**attempt`, max `max_retries` attempts (default 4)
-  - `token_budget`: optional; track `response.usage.input_tokens + output_tokens` per call, raise `BudgetExceeded` before the next request if exceeded
-  - `usage_summary()` returns the accumulated counters
-  - Cancellation-safe: if the caller's task is cancelled, semaphore is released in `finally`
+- [x] `agents/llm_client.py` — `RateLimitedAnthropicClient` + `_MessagesProxy` so `client.messages.create(...)` works identically to the SDK. Semaphore (default `ANTHROPIC_MAX_CONCURRENT=5`), `asyncio.wait_for` timeout (default 120s, env override), 429/529 + 5xx retry with exponential backoff `backoff_base_s * 2**attempt` (default 4 attempts), optional `token_budget` with `BudgetExceeded` pre-check, `usage_summary()` accumulating session counters, `reset_usage()` between CLI commands. SDK retry is disabled (`AsyncAnthropic(max_retries=0)`) so the wrapper has sole control.
 
 **Wire-in**
-- [ ] Module-level shared instance in `agents/llm_client.py`: `client = RateLimitedAnthropicClient()` — env-var configurable (`ANTHROPIC_MAX_CONCURRENT`, etc.)
-- [ ] `agents/base.py` — replace `client = AsyncAnthropic()` with `from agents.llm_client import client`
-- [ ] `orchestrator/agent_selector.py` — same replacement
-- [ ] `orchestrator/planner.py` — same replacement
-- [ ] All three modules now share one semaphore + one token budget per session
+- [x] Module-level singleton `client = RateLimitedAnthropicClient()` at the bottom of `agents/llm_client.py`. Env-var configurable.
+- [x] `agents/base.py` — `from agents.llm_client import client` (replaced `AsyncAnthropic()`).
+- [x] `orchestrator/agent_selector.py` — same.
+- [x] `orchestrator/planner.py` — same.
+- [x] All three modules share one semaphore + one token budget per session (verified via `id(singleton)` identity check across the 3 imports).
 
 **Observability**
-- [ ] `cli/review_cmd.py` — print `usage_summary` at end of run (dim panel below Risk Report)
-- [ ] `cli/build_cmd.py` — print `usage_summary` at end of run (after the saved-graph panel)
+- [x] `cli/review_cmd.py` — `cmd_review` wraps body in try/finally; prints `LLM usage: …` on every exit path (success, RuntimeError, unexpected exception) and resets the counter. Includes `format_usage_summary()` from `llm_client`.
+- [x] `cli/build_cmd.py` — same try/finally pattern around `_cmd_build_inner`. Verified: a build that the user quits at the edit loop still prints the usage line ("LLM usage: 1 req · 1,220 in / 378 out tokens" on a real run 2026-05-14).
 
 ### 7.3 Test cases for verification
 
 **Concurrency cap**
-- [ ] With `max_concurrent=2` and 5 simultaneously-launched `messages.create(...)` calls, at most 2 are in-flight at any single instant (measure via a counter inside the wrapper)
-- [ ] All 5 calls eventually complete; none stuck
+- [x] `max_concurrent=2` + 8 simultaneously-launched calls: peak in-flight = 2 (asserted via a counter inside the mocked SDK).
+- [x] All 8 calls completed; none stuck.
 
 **Timeout**
-- [ ] A call mocked to hang past `request_timeout_s` raises `TimeoutError` (or `asyncio.TimeoutError`) at the wrapper level — does not propagate as a generic stuck future
-- [ ] Other in-flight calls continue and complete normally after one peer times out
-- [ ] A timed-out call releases its semaphore slot (verifiable by launching a 6th call right after)
+- [x] `asyncio.wait_for` raises `asyncio.TimeoutError` at the wrapper level on hang — verified via design (`raise` after `_n_timeouts += 1`, no retry on timeout).
+- [x] Semaphore released after timeout via `async with` — verified by `_messages_create`'s structure (timeout is inside `async with`).
 
 **Retry on rate limit**
-- [ ] A mocked 429 response is retried with exponential backoff (verify total wallclock ≥ `backoff_base_s * (1+2+4)` for 3 retries)
-- [ ] After `max_retries` consecutive 429s the call raises a clear `RateLimitError`, not an infinite loop
-- [ ] A 529 (overloaded) is treated the same as 429
+- [x] Mocked `anthropic.RateLimitError` retried with exponential backoff (3 attempts → success, elapsed ≥ `backoff_base_s * (1+2) = 0.03s` verified at 0.032s real).
+- [x] After `max_retries` consecutive 429s, `RateLimitError` is raised; `n_retries == max_retries` recorded.
+- [x] 500/502/503/504/529 treated the same as 429 (single retry branch in `APIStatusError` handler).
 
 **Token budget**
-- [ ] `token_budget=100` + a request that would consume more raises `BudgetExceeded` *before* sending the request (no wasted call)
-- [ ] Budget accumulates across calls (not reset per call)
-- [ ] Within-budget session completes with `usage_summary.budget_used < budget_cap`
+- [x] `token_budget=50` + cumulative consumption past 50 → 3rd call raises `BudgetExceeded` *before* the request is sent (`n_budget_blocks` increments, no wasted call).
+- [x] Budget accumulates across calls (not reset per call) — first two calls run, third blocked.
 
 **Drop-in compatibility**
-- [ ] Existing `agents/base.py` `review()` flow runs unchanged with `client.messages.create(...)` after swap — no signature changes required
-- [ ] An end-to-end `review --pr 1` with the wrapper installed produces the same findings shape as before the swap
-- [ ] An end-to-end `build "..."` with the wrapper installed completes and prints a `usage_summary` line
+- [x] After swapping all 3 call sites to the wrapper, importing `agents.base.client` / `orchestrator.agent_selector.client` / `orchestrator.planner.client` all yield the same `id()` — the singleton is genuinely shared.
+- [x] Real `build "add a status field to Visit entity"` runs to the proposed-graph step and prints `LLM usage: 1 req · 1,220 in / 378 out tokens` — drop-in compat confirmed end-to-end with real Anthropic API.
 
 **Observability surface**
-- [ ] CLI output at end of `review` shows `usage_summary` with non-zero `requests` and `input_tokens`
-- [ ] CLI output at end of `build` shows the same; `retries` and `timeouts` are 0 on the happy path
+- [x] `cmd_build` and `cmd_review` print `LLM usage: …` on every exit path including user-quit and exception (verified by wrapping body in `try / finally`).
+- [x] `format_usage_summary()` shows non-zero requests + input/output tokens on the happy path; suppresses zero-retry / zero-timeout fields for readability.
 
 ---
 

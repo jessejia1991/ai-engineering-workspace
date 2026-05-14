@@ -18,13 +18,12 @@ chunk; for now the planner runs cold every time.
 
 import os
 import json
-from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
+from agents.llm_client import client    # P3: rate-limited HTTP wrapper
 from memory.vector_store import query_relevant_plans, format_plans_for_prompt
 
 load_dotenv()
 
-client = AsyncAnthropic()
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 NODE_TYPES = ["migration", "backend", "backend-test",

@@ -3,6 +3,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich import box
 
+from agents.llm_client import client as llm_client, format_usage_summary
+
 console = Console()
 
 SEVERITY_COLORS = {
@@ -73,6 +75,18 @@ def _render_agent_reasoning(reasoning_by_agent: dict, agents_run: list):
 
 
 async def cmd_review(pr_number: int, branch: str = None):
+    try:
+        await _cmd_review_inner(pr_number, branch)
+    finally:
+        # P3: LLM usage observability — print on every exit path
+        # (success, RuntimeError, unexpected exception). Reset for next.
+        usage = llm_client.usage_summary()
+        if usage["requests"] > 0:
+            console.print(f"[dim]LLM usage: {format_usage_summary(usage)}[/dim]")
+        llm_client.reset_usage()
+
+
+async def _cmd_review_inner(pr_number: int, branch: str = None):
     from orchestrator.runner import run_review
     from github_client import post_review_comments
     from database import get_agent_reasoning

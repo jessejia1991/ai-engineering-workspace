@@ -26,6 +26,7 @@ from database import init_db, save_graph
 from scanner.repo_scanner import load_profile
 from orchestrator.planner import plan
 from memory.vector_store import add_plan, get_stats
+from agents.llm_client import client as llm_client, format_usage_summary
 from models import TaskNode, TaskGraph
 
 
@@ -376,6 +377,18 @@ async def cmd_build(requirement: str) -> None:
         console.print("[red]Usage: build \"<natural-language requirement>\"[/red]")
         return
 
+    try:
+        await _cmd_build_inner(requirement)
+    finally:
+        # P3: LLM usage observability — print on every exit path
+        # (success, user quit, planner exception). Reset for next command.
+        usage = llm_client.usage_summary()
+        if usage["requests"] > 0:
+            console.print(f"[dim]LLM usage: {format_usage_summary(usage)}[/dim]")
+        llm_client.reset_usage()
+
+
+async def _cmd_build_inner(requirement: str) -> None:
     await init_db()
 
     try:
