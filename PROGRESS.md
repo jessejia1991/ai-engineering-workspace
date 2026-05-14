@@ -1,7 +1,7 @@
 # PROGRESS.md — AI Engineering Workspace
 
-**Repo:** `jessejia1991/ai-engineering-workspace` (branch: `temp-branch`)
-**Last commit:** `7e71c64 temp commit`
+**Repo:** `jessejia1991/ai-engineering-workspace` (branch: `main`)
+**Last commit:** `981a8cf docs: add CLAUDE.md and PROGRESS.md for work plan tracking`
 **Deadline:** 2026-05-18 (received 2026-05-13 evening; ~4 working days)
 **Follow-up:** live walk-through meeting after submission
 **Source brief:** `Gmail_-_Interview_Project_Timeline.pdf` (decodeorigin Senior AI Engineer assessment)
@@ -85,29 +85,55 @@ ai-engineering-workspace/
     └── repo_scanner.py          (269)  scan, classify, repo_profile
 ```
 
-**Missing:** `README.md`, `requirements.txt`, `.gitignore`, `tests/`.
+**Missing:** `README.md`, `requirements.txt`. (`.gitignore` exists but is incomplete — missing `.ai-workspace/`, `workspace.db`, `.cache/`; see §5.2. `tests/` now contains `test_memory.py` from §12 verification.)
 
 ### 3.2 What works (Day 1–3)
 
-- **Day 1 (committed):** repo scanner, file classification, repo_profile generation, SQLite schema.
-- **Day 2 (committed):** five agents inheriting from BaseAgent run in parallel via `runner.run_review`. Dynamic agent selection works. Findings post to GitHub via `github_client.post_review_comments`.
-- **Day 3 (uncommitted, working tree):** ChromaDB memory wired in. Agents return `(findings, reasoning)`. `execution_log` captures reasoning. `reflect` writes corrections back to ChromaDB on reject. Both `review` and `reflect` CLI output surface reasoning (`codebase_understanding`, `rejected_candidates`, `memory_injected`).
+- **Day 1 (committed, `66f2524`):** repo scanner, file classification, repo_profile generation, SQLite schema.
+- **Day 2 (partially committed, `a234260`):** `BaseAgent` + `BugFindingAgent` + `SecurityAgent` + `agent_selector` + `runner.run_review` parallel orchestration. The other three agents (`performance`, `testing`, `uiux`) and `github_client.py` were authored after the commit and currently live in the working tree.
+- **Day 3 (uncommitted, working tree):** ChromaDB memory wired in (`memory/vector_store.py`). Agents return `(findings, reasoning)`. `execution_log` captures reasoning. New `cli/reflect_cmd.py` writes corrections back to ChromaDB on reject. Both `review` and `reflect` CLI output surface reasoning (`codebase_understanding`, `rejected_candidates`, `memory_injected`). A temporary `temp commit` that bundled all of Day 2-residue + Day 3 was reset to keep history clean, so everything below is uncommitted.
 
-### 3.3 Uncommitted changes in working tree
+### 3.3 Day 3 delta (now committed on `main`)
 
-Five files modified, **not yet committed**:
+**Resolved 2026-05-14.** The table below was the working-tree snapshot before commit; it remains as a record of what Day 3 actually contained. After resetting an earlier temp commit, the entire Day 2-residue + Day 3 delta lived uncommitted on `main` and was reconciled against `git status` before being committed. See `git log` on `main` for the exact commit SHA — kept out of this doc so amends do not invalidate it.
+
+**Modified (8 tracked files):**
 
 | File | Change | Why |
 |---|---|---|
 | `database.py` | `get_agent_reasoning(task_id)` reads `agent_result` rows into per-agent dict (handles retries — last attempt wins). | Shared retrieval helper for reasoning display. |
-| `database.py` | `clear_unreviewed_findings(task_id)` deletes findings where `accepted IS NULL`. | Re-review of same PR clears stale untriaged findings while keeping accepted/rejected as history. |
+| `database.py` | `clear_unreviewed_findings(task_id)` deletes findings where `accepted IS NULL`. | Re-review clears stale untriaged findings while keeping accepted/rejected as history. |
 | `database.py` | `create_task` → `INSERT … ON CONFLICT DO UPDATE` upsert. | Re-running review resets task to PENDING instead of crashing on UNIQUE constraint. |
-| `cli/review_cmd.py` | `_render_agent_reasoning()` called between "Agent Selection" and "Findings". | Make hidden state observable in review output. |
-| `cli/reflect_cmd.py` | `_render_finding_reasoning()` called per-finding. | Human needs reasoning context before accept/reject (Design Doc §4.3). |
-| `cli/main.py` | Removed duplicate `_cmd_reflect`; implemented `_cmd_logs`. | Cleanup + make `logs` command actually work. |
-| `orchestrator/runner.py` | Import + call `clear_unreviewed_findings` after `create_task`. | Pairs with the create_task upsert. |
+| `agents/base.py` | Reasoning schema + `parse_response` updates + memory parameter on `review()`. | Implements the agent contract in §13.1 (return `(findings, reasoning)`). |
+| `agents/bug_finding.py` | Prompt rewritten to emit the new JSON-with-reasoning shape. | Day 3 reasoning contract. |
+| `agents/security.py` | Prompt rewritten to emit the new JSON-with-reasoning shape. | Day 3 reasoning contract. |
+| `cli/main.py` | Removed duplicate `_cmd_reflect`; implemented `_cmd_logs`; wired `reflect_cmd`. | Cleanup + make `logs` command work. |
+| `cli/review_cmd.py` | `_render_agent_reasoning()` called between "Agent Selection" and "Findings"; memory_injected display. | Make hidden state observable. |
+| `orchestrator/runner.py` | Calls `clear_unreviewed_findings` after `create_task`; queries memory before each agent; logs `memory_injected` in `agent_result`. | Pairs with upsert; closes the memory loop. |
+| `.ai-workspace/repo-context.json` | Re-run of `scan` output. | Runtime artifact — likely should be `.gitignore`d (see §5.2). |
 
-These passed isolated unit tests in the conversation that produced this doc. **End-to-end with real ChromaDB + Anthropic API has not been run yet** — that's Priority 1 below.
+**New (7 untracked entries):**
+
+| Path | Purpose |
+|---|---|
+| `agents/performance.py` | PerformanceAgent (concurrency, N+1, hot paths). |
+| `agents/testing.py` | TestingAgent — currently does test *review*, not generation (gap noted in §3.4). |
+| `agents/uiux.py` | UIUXAgent for accessibility / UX critique on frontend diffs. |
+| `cli/reflect_cmd.py` | Whole reflect command — human triage loop with per-finding reasoning render + correction write-back. |
+| `github_client.py` | Posts findings to GitHub PR via PyGithub. |
+| `memory/vector_store.py` | ChromaDB three-layer memory (findings / corrections / repo_profile) + `query_relevant_memory` + `format_memory_for_prompt` + `get_stats`. |
+| `.ai-workspace/chroma_db/` | Runtime artifact — must be `.gitignore`d (handled in §5.2). |
+
+The individual files have been smoke-tested in prior conversations, but **end-to-end with real ChromaDB + Anthropic API has not been run yet** on the current working-tree state — that's §12 / Priority 1 below.
+
+**Addendum (2026-05-14, during §12 verification):** three additional fixes had to be applied for end-to-end to actually work:
+
+| File | Change | Why |
+|---|---|---|
+| `memory/vector_store.py` | New module-level `_init_lock = threading.RLock()` (started as `Lock`, changed to `RLock`). | `get_findings_collection()` holds the lock then calls `get_client()` which tries to take it again — same thread, non-reentrant Lock deadlocks. RLock fixes; verified by `test_memory.py`. |
+| `orchestrator/runner.py` | Memory retrieval changed from `asyncio.gather(asyncio.to_thread(...))` to a serial list comprehension. | ChromaDB 1.5.9's Rust bindings hang when `PersistentClient` init races across multiple worker threads. Memory queries are ms-scale, so serial is essentially free. |
+| `agents/base.py` | `max_tokens 2500 → 6000`; capture `_raw_response` + `_stop_reason` into the returned reasoning dict. | First verification run had SecurityAgent's JSON truncated at 2500 tokens, fell through to fallback parser and produced 4 empty findings. Higher cap stopped truncation; raw_response captured for future debugging. |
+| `tests/test_memory.py` + `tests/__init__.py` (new) | Standalone smoke test for vector_store sync / async / write-back. Run with `python -m tests.test_memory [sync|async|write|all]`. | Used to isolate the RLock bug; now a useful regression check. |
 
 ### 3.4 Coverage vs the brief
 
@@ -135,7 +161,7 @@ The plan in §4 addresses missing items either by building them or explicitly di
 
 ## 4. Work plan — May 14–18
 
-> **Cursor:** §5 Priority 1, first unchecked task. Last verified: none — start by running §12 verification path against real ChromaDB + Anthropic API.
+> **Cursor:** §5 Priority 1, first unchecked task = `Write requirements.txt`. Day 3 work + §12 verification fixes committed locally on `main` (not yet pushed; see `git log` for current HEAD).
 >
 > *Update this line as work progresses. Claude Code reads this on every "continue" request to find the next task.*
 
@@ -193,8 +219,8 @@ The walk-through follow-up is live — so **demoability of the end-to-end exampl
 
 ### 5.2 Tasks
 
-- [ ] Run §6 end-to-end verification path (review → reflect → second review with non-zero memory injected)
-- [ ] Commit + push the 5-file working-tree change to `temp-branch`
+- [x] Run §12 end-to-end verification path (review → reflect → second review with non-zero memory injected) — completed 2026-05-14, all 6 steps passed; closed loop demonstrably working (3 findings → 1 after one reflect cycle).
+- [x] Commit Day 3 + verification fixes to `main` — done 2026-05-14: `feat(p1): wire end-to-end memory loop and harden ChromaDB init`. See `git log` for the current HEAD SHA (kept out of this doc so amends don't invalidate it). **Push to origin/main not done — awaits user confirmation.**
 - [ ] Write `requirements.txt` (anthropic / aiosqlite / chromadb / sentence-transformers / click / rich / pydantic / python-dotenv / PyGithub / gitpython)
 - [ ] Write `.gitignore` (`.ai-workspace/`, `__pycache__/`, `venv/`, `.env`)
 - [ ] Write `README.md` (architecture diagram, quickstart, command reference, demo path)

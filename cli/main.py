@@ -184,11 +184,91 @@ async def _cmd_review(pr_number: int, branch: str = None):
 
 
 async def _cmd_reflect(task_id: str = None):
-    console.print("[yellow]reflect command coming in Day 3[/yellow]")
+    from cli.reflect_cmd import cmd_reflect
+    await cmd_reflect(task_id)
 
 
 async def _cmd_logs(task_id: str = None):
-    console.print("[yellow]logs command coming in Day 3[/yellow]")
+    from database import init_db, get_execution_log, get_all_tasks
+
+    await init_db()
+
+    # If no task_id, fall back to the most recent task
+    if not task_id:
+        tasks = await get_all_tasks()
+        if not tasks:
+            console.print("[dim]No tasks yet. Run a review first.[/dim]")
+            return
+        task_id = tasks[0]["id"]
+        console.print(f"[dim]Using most recent task: {task_id}[/dim]\n")
+
+    rows = await get_execution_log(task_id)
+    if not rows:
+        console.print(f"[dim]No execution log entries for {task_id}.[/dim]")
+        return
+
+    console.print(f"\n[bold]Execution log for {task_id}[/bold] ({len(rows)} entries)\n")
+
+    for row in rows:
+        event = row.get("event_type", "")
+        agent = row.get("agent", "")
+        ts    = (row.get("created_at") or "")[:19]
+
+        try:
+            payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+
+        console.print(
+            f"[dim]{ts}[/dim]  [bold cyan]{event}[/bold cyan]  "
+            f"[dim]{agent}[/dim]"
+        )
+
+        if event == "agent_selection":
+            selected = payload.get("selected", [])
+            skipped  = payload.get("skipped", {})
+            console.print(f"  Selected: {', '.join(selected) or '(none)'}")
+            for ag, reason in skipped.items():
+                console.print(f"  [dim]Skipped {ag}: {reason}[/dim]")
+
+        elif event == "agent_result":
+            latency = payload.get("latency_ms")
+            count   = payload.get("finding_count")
+            status  = payload.get("status", "ok")
+            console.print(
+                f"  [dim]status={status}  latency={latency}ms  "
+                f"findings={count}[/dim]"
+            )
+
+            memory = payload.get("memory_injected", {}) or {}
+            mf = memory.get("findings_count", 0)
+            mc = memory.get("corrections_count", 0)
+            console.print(
+                f"  [dim]Memory injected: {mf} finding(s), "
+                f"{mc} correction(s)[/dim]"
+            )
+
+            reasoning = payload.get("reasoning", {}) or {}
+            understanding = reasoning.get("codebase_understanding")
+            if understanding:
+                console.print(f"  [dim]Understanding:[/dim] {understanding}")
+
+            rejected = reasoning.get("rejected_candidates", []) or []
+            if rejected:
+                console.print(f"  [dim]Rejected candidates ({len(rejected)}):[/dim]")
+                for rc in rejected:
+                    issue = rc.get("issue", "")
+                    why   = rc.get("why_rejected", "")
+                    console.print(f"    [yellow]–[/yellow] {issue}")
+                    if why:
+                        console.print(f"      [dim]→ {why}[/dim]")
+
+        elif event == "agent_retry":
+            attempt = payload.get("attempt")
+            error   = payload.get("error", "")
+            console.print(f"  [red]retry #{attempt}: {error}[/red]")
+
+        console.print()
 
 
 if __name__ == "__main__":

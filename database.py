@@ -47,12 +47,34 @@ async def init_db():
 
 
 async def create_task(task_id: str, task_type: str, artifacts: dict):
+    # Upsert: re-running review on the same PR resets the task to PENDING
+    # instead of crashing on UNIQUE constraint.
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO tasks (id, type, artifacts) VALUES (?, ?, ?)",
+            """
+            INSERT INTO tasks (id, type, artifacts)
+            VALUES (?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                type       = excluded.type,
+                artifacts  = excluded.artifacts,
+                status     = 'PENDING',
+                updated_at = CURRENT_TIMESTAMP
+            """,
             (task_id, task_type, json.dumps(artifacts))
         )
         await db.commit()
+
+
+async def clear_unreviewed_findings(task_id: str) -> int:
+    # Re-review of the same PR clears stale untriaged findings while keeping
+    # human-accepted / rejected ones as history.
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM task_findings WHERE task_id=? AND accepted IS NULL",
+            (task_id,)
+        )
+        await db.commit()
+        return cursor.rowcount or 0
 
 
 async def update_task_status(task_id: str, status: str):
@@ -133,3 +155,56 @@ async def get_execution_log(task_id: str):
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
+
+
+async def get_agent_reasoning(task_id: str) -> dict:
+    """
+    Return per-agent reasoning chains for a task, keyed by agent name.
+
+    Reads 'agent_result' rows from execution_log and extracts the reasoning
+    and memory_injected payloads written by the orchestrator. This is the
+    bridge that turns hidden agent reasoning into observable state for the
+    review display, the reflect command, and the logs command.
+
+    Returns:
+        {
+          "SecurityAgent": {
+            "reasoning": {
+              "codebase_understanding": "...",
+              "rejected_candidates": [...],
+              "confidence_per_finding": {...},
+            },
+            "memory_injected": {"findings_count": 3, "corrections_count": 1},
+            "latency_ms": 18400,
+            "finding_count": 1,
+            "status": "ok",
+          },
+          ...
+        }
+    """
+    rows = await get_execution_log(task_id)
+    by_agent: dict = {}
+
+    for row in rows:
+        if row.get("event_type") != "agent_result":
+            continue
+
+        agent = row.get("agent", "")
+        if not agent:
+            continue
+
+        try:
+            payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+
+        # If an agent retried, the last agent_result row wins (latest attempt).
+        by_agent[agent] = {
+            "reasoning":       payload.get("reasoning", {}) or {},
+            "memory_injected": payload.get("memory_injected", {}) or {},
+            "latency_ms":      payload.get("latency_ms"),
+            "finding_count":   payload.get("finding_count"),
+            "status":          payload.get("status", "ok"),
+        }
+
+    return by_agent

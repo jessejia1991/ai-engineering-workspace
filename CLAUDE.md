@@ -89,7 +89,8 @@ PROGRESS.md §4.3 marks Priority 2's "auto-advance engine" as **stretch only**. 
 ### Commit hygiene
 
 - Commit after each Priority finishes, not after each task.
-- Commit messages: `feat(pN): ...` for new functionality, `fix(pN): ...` for bug fixes, `docs: ...` for docs-only changes.
+- **Every commit must include any uncommitted `PROGRESS.md` edits.** Cursor updates, §X.2/§X.3 checkbox ticks, and §3.3-style status notes belong with the work they describe — stage `PROGRESS.md` alongside the code in the same commit, never in a separate `docs: update PROGRESS.md` commit. If you forgot and the commit is still local (not pushed), amend it in.
+- Commit messages: `feat(pN): ...` for new functionality, `fix(pN): ...` for bug fixes, `docs: ...` for docs-only changes (README, design doc).
 - Never commit `.env`, `.ai-workspace/`, `__pycache__/`, or `venv/`. The `.gitignore` should prevent this; if it doesn't, fix `.gitignore` first.
 
 ### When stuck

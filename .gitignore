@@ -5,3 +5,4 @@ __pycache__/
 *.db
 reports/
 .ai-workspace/reflection-log.json
+.ai-workspace/chroma_db/

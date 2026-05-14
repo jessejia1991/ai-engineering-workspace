@@ -11,29 +11,21 @@ class BugFindingAgent(BaseAgent):
         diff: str,
         file_contents: dict,
         repo_profile: dict,
-        reflection: list,
+        memory: dict,
     ) -> str:
 
-        files_text = ""
-        for path, content in file_contents.items():
-            files_text += f"\n### {path}\n```\n{content}\n```\n"
+        files_text  = self._format_files(file_contents)
+        memory_text = self._format_memory(memory)
 
-        corrections = self._format_corrections(repo_profile.get("corrections", []))
-        history = self._format_reflection(reflection)
+        return f"""You are a bug-finding code reviewer for a software engineering team.
 
-        return f"""You are a bug-finding code reviewer. Your job is to find real bugs and logic errors in this code change.
-
-## Past corrections about this codebase
-These are things we previously misunderstood — do not repeat these mistakes:
-{corrections}
-
-## Your review history on this repo
-{history}
+## Relevant memory from past reviews
+{memory_text}
 
 ## Task
 {task.description}
 
-## Changed files content
+## Changed files
 {files_text}
 
 ## Git diff
@@ -43,29 +35,17 @@ These are things we previously misunderstood — do not repeat these mistakes:
 
 ## What to look for
 - Null pointer / NullPointerException risks
-- Missing null checks on return values from database or API calls
+- Missing null checks on return values from DB or API calls
 - Edge cases not handled (empty list, zero, negative numbers)
-- Async/concurrency issues
 - Logic errors in conditionals
 - Missing error handling on external calls
-- Incorrect data transformation
-- Off-by-one errors
 - API response errors shown only in console, not to the user
+- Incorrect data transformation or off-by-one errors
 
-## Instructions
-- Only report issues you can see evidence of in the actual code
+## Rules
+- Only report issues with clear evidence in the actual code
 - Do not report style issues or minor improvements
-- Do not report issues already handled correctly
-- If you find no issues, return an empty array
+- Check memory: if a similar finding was rejected before, document why in rejected_candidates
 
-Return a JSON array of findings. Each finding must have:
-- severity: "low" | "medium" | "high" | "critical"
-- category: short string e.g. "null-handling", "error-handling", "logic-error"
-- title: one line description
-- detail: specific explanation referencing actual code
-- suggestion: concrete fix
-- file: relative file path (if applicable)
-- line: line number (if applicable)
-
-Return ONLY the JSON array, no other text.
+{self._reasoning_instructions()}
 """
