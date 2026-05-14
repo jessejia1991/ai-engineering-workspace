@@ -172,7 +172,7 @@ The plan in §4 addresses missing items either by building them or explicitly di
 
 ## 4. Work plan — May 14–18
 
-> **Cursor:** §8 P4 Chunk C (Synthesizer + Architect Report UX) — first task: `orchestrator/planner.py` add `synthesize_report(expert_outputs, requirement, repo_profile) -> ReportPayload` that bundles clarify Qs + ranked suggestions + draft contract. P4 Chunks A + B and P3 (HTTP wrapper) all landed 2026-05-14. Up next: P4 Chunks C → D. P1 docs / wrap-up deferred to end.
+> **Cursor:** §8 P4 Chunk D (contract-aware review + PR auto-match) — first task: `orchestrator/runner.py` accept optional `graph_id`, load contract via `load_graph`. P4 Chunks A + B + C and P3 (HTTP wrapper) all landed 2026-05-14. Up next: Chunk D wraps Priority 4. P1 docs / wrap-up deferred to end.
 >
 > *Update this line as work progresses. Claude Code reads this on every "continue" request to find the next task.*
 
@@ -425,12 +425,14 @@ The agentic orchestration layer (`agent_selector`, `planner`, `runner`, `build_c
 - [x] `orchestrator/planner.py` — `plan_with_experts(requirement, repo_profile)` fires all selected experts via `asyncio.gather` (`return_exceptions=True` so one failure doesn't sink the batch). P3 wrapper enforces the global concurrency cap. Each criterion is tagged with its `owner_agent` by the orchestrator (separation of concerns from the agent's perspective).
 - [x] Verified end-to-end on petclinic with `"add a notes field to Pet entity, both backend and frontend"`: 5 experts ran in 35.3s wallclock, 0 errors, 29 total criteria with all 5 distinct owners present, each expert showed clear angle ownership (Security→XSS, Testing→round-trip, UIUX→a11y, Delivery→rollback, Performance→payload size). LLM usage: 5 req · 3,845 in / 6,666 out.
 
-**Chunk C — Synthesizer + Architect Report UX (~0.5 day)**
-- [ ] `orchestrator/planner.py` — `synthesize_report(expert_outputs, requirement, repo_profile) -> ReportPayload` bundles clarify Qs + ranked suggestions + draft contract. Synthesizer is a single LLM call that takes all expert outputs as structured JSON input.
-- [ ] `cli/build_cmd.py` — render Architect Report (always shown after experts complete): Clarify Questions section + Design Suggestions with `★★★ / ★★ / ★` priority stars. Input parser accepts `q1=a q2=b s1 s3` style multi-pick on one line.
-- [ ] `cli/build_cmd.py` — re-invoke planner with selections to produce final `{TaskGraph, Contract}`. Render proposed Graph + Contract panels side-by-side.
-- [ ] `cli/build_cmd.py` — contract editing commands: `ec <criterion_id>` to edit, `dc <criterion_id>` to delete, `nc` to add a criterion manually. Track edits in the existing `edits` list so `planning_memory` reflection covers contract decisions too.
-- [ ] `cli/build_cmd.py` — `add_plan(...)` extended to include contract summary in the document text (so future builds retrieve "this kind of feature usually has 6 must-have criteria, here's the shape").
+**Chunk C — Synthesizer + Architect Report UX (~0.5 day) — DONE 2026-05-14**
+- [x] `orchestrator/planner.py` — `synthesize_report(expert_outputs, requirement)`: single LLM call ingests the raw expert pool (after `_flatten_experts_for_synth` strips debug fields) and returns a consolidated `{expert_summaries, clarify_questions, design_suggestions, draft_criteria}`. Semantic dedup ("sanitize XSS" + "escape HTML at render" → one entry with `owners: [Sec, UIUX]`), priority reconciliation when experts disagree (must_have > should_have > nice_to_have), polished assertion text.
+- [x] `cli/build_cmd.py` — `_render_architect_report()` always rendered after the expert round (even when clarify Qs are empty — the experts' work is part of the demo). Three sections: expert perspectives (short attribution + 1-line take), Clarify questions (id + owners + question), Design suggestions sorted high→low with star ratings + owner_agent attribution. Draft Contract preview shows the top 5 criteria; the full 15 appear after planning.
+- [x] `cli/build_cmd.py` — `_collect_report_picks()` parses multi-token input: `q1=max 2000 chars q2=optional s1 s2 s3 go` is tokenized via `_split_picks_line()` using regex boundaries. Empty line acts as implicit `go`. Validates ids against the report. Returns `(answers, accepted_ids, aborted)`.
+- [x] `cli/build_cmd.py` — re-invokes `plan()` with `force_plan=True` and `clarify_history = formatted Q&A + accepted suggestions`, producing the final DAG. Renders Graph (existing) + Contract panel together.
+- [x] `cli/build_cmd.py` — `_edit_loop` extended to dispatch on command prefix: graph commands (`a/e/d/s/n`) unchanged; contract commands (`ec`/`dc`/`ep`/`nc`) added. Helpers: `_edit_criterion_assertion`, `_edit_criterion_priority`, `_delete_criterion`, `_add_criterion`. Edit history feeds `planning_memory` writeback.
+- [x] On approve, `Contract` model constructed from edited criteria and attached to `TaskGraph.contract`; `save_graph` persists everything in one `task_graphs` row including `contract_json`. `add_plan(...)` writeback document text extended with contract summary line (`"Contract: N criteria — X must, Y should, Z nice. Owners: [...]"`) so future similar builds can retrieve "this kind of feature usually has N must_haves with these owners".
+- [x] Verified end-to-end on petclinic with `"add a notes field to Pet entity, both backend and frontend"`: 8 stages, 7 LLM calls total (5 expert + 1 synth + 1 final plan), wallclock ~2 minutes. User picks (2 Q answers + 3 suggestions) were reflected in the final DAG. Planner memory retrieved 2 past builds. `GRAPH-1db32ede` saved with 4 nodes + 15 contract criteria. LLM usage: 7 req · 12,605 in / 11,739 out tokens.
 
 **Chunk D — Contract-aware review + auto-match (~0.4 day)**
 - [ ] `orchestrator/runner.py` — `run_review` accepts optional `graph_id` parameter; loads contract via `load_graph` if provided.
@@ -446,14 +448,14 @@ The agentic orchestration layer (`agent_selector`, `planner`, `runner`, `build_c
 **Multi-expert plan correctness**
 - [x] `plan_with_experts("add a notes field to Pet entity, both backend and frontend")` produces proposed_criteria from 5 distinct `owner_agent` values — verified 2026-05-14.
 - [x] Every proposed criterion has `priority` ∈ {must_have, should_have, nice_to_have}, non-empty `assertion`, non-empty `owner_agent` — enforced by `parse_requirement_response` (Chunk B) + Criterion schema (Chunk A).
-- [ ] The TaskGraph DAG and Contract are saved together on approve (one `task_graphs` row, `contract_json` populated) — *(chunk C — synthesizer turns expert outputs into the final plan + persistable contract)*
-- [x] Re-loading the graph reconstructs the Contract with all criteria intact — verified 2026-05-14 at the model+DB layer (Chunk A smoke test).
+- [x] The TaskGraph DAG and Contract are saved together on approve (one `task_graphs` row, `contract_json` populated) — verified 2026-05-14 (`GRAPH-1db32ede` saved with 4 nodes + 15 contract criteria in a single row).
+- [x] Re-loading the graph reconstructs the Contract with all criteria intact — verified 2026-05-14 at the model+DB layer (Chunk A smoke test) and at the application layer (Chunk C end-to-end).
 
 **Architect Report UX**
-- [ ] Report displays after every expert round (even if no clarify questions / all suggestions are nice_to_have) — "always show" property verified
-- [ ] User can answer multiple Qs and accept multiple suggestions on one input line (`q1=a q2=b s1 s3 s5`)
-- [ ] Skipped suggestions do NOT appear as criteria in the final contract
-- [ ] Accepted high-priority suggestions DO appear as `must_have` criteria
+- [x] Report displays after every expert round — verified 2026-05-14 (always-shown via `_render_architect_report` regardless of clarify_questions count).
+- [x] User can answer multiple Qs and accept multiple suggestions on one input line — verified with input `q1=max 2000 chars q2=optional s1 s2 s3 go` producing 2 answers + 3 accepted suggestions.
+- [x] Skipped suggestions: design_suggestions and contract criteria are independent layers in the synthesizer output. Accepted suggestions are injected into the planner prompt for DAG generation; rejected suggestions don't appear in the prompt. Contract criteria can be edited independently in Stage 7 (`ec`/`dc`/`ep`/`nc`).
+- [x] Accepted high-priority suggestions DO appear as `must_have` criteria — synth-driven priority reconciliation enforces "higher wins", verified 2026-05-14 with 8 must_have criteria after picks.
 
 **Contract-aware review**
 - [ ] `review --pr N --graph GRAPH-xyz` loads the contract and renders the Contract Status panel

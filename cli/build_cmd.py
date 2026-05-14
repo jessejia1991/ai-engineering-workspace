@@ -1,19 +1,19 @@
 """
-`build "<requirement>"` — single-pass + clarify-gate breakdown UX.
+`build "<requirement>"` — multi-expert plan + Architect Report + contract.
 
-Flow:
-    1. Scan-load repo_profile.
-    2. Call planner. If it asks to clarify, collect user answers and
-       re-invoke with force_plan=True.
-    3. Render the proposed DAG.
-    4. Accept structured edits (e/d/s/n) until the user approves (a) or
-       quits (q).
-    5. On approve, persist the graph via database.save_graph.
-
-planning_memory write-back + retrieval is wired in a later chunk.
+Flow (P4 Chunk C):
+    Stage 1  plan_with_experts   — 5 expert agents review the requirement
+    Stage 2  synthesize_report   — LLM consolidates into a triage payload
+    Stage 3  render Report       — always shown to the user
+    Stage 4  collect picks       — user answers Qs + accepts suggestions
+    Stage 5  plan() final        — generate the DAG using augmented req
+    Stage 6  render Graph + Contract
+    Stage 7  unified edit loop   — graph (e/d/s/n) and contract (ec/dc/nc)
+    Stage 8  save                — graph + contract together, planning_memory
 """
 
 import uuid
+import re
 import json
 from datetime import datetime
 
@@ -24,10 +24,10 @@ from rich import box
 
 from database import init_db, save_graph
 from scanner.repo_scanner import load_profile
-from orchestrator.planner import plan
+from orchestrator.planner import plan, plan_with_experts, synthesize_report
 from memory.vector_store import add_plan, get_stats
 from agents.llm_client import client as llm_client, format_usage_summary
-from models import TaskNode, TaskGraph
+from models import TaskNode, TaskGraph, Contract, Criterion
 
 
 console = Console()
@@ -73,85 +73,351 @@ def _render_graph(graph: TaskGraph) -> None:
 
 def _print_edit_help() -> None:
     console.print(
-        "  [bold][[green]a[/green]]pprove  "
-        "[[yellow]e[/yellow]] <id> edit  "
-        "[[red]d[/red]] <id> delete  "
-        "[[cyan]s[/cyan]] <id> split  "
-        "[[magenta]n[/magenta]] new node  "
-        "[[dim]l[/dim]] list  "
-        "[[red]q[/red]]uit[/bold]"
+        "  [bold]Graph:[/bold]    "
+        "[green]a[/green]pprove   "
+        "[yellow]e[/yellow] <id> edit   "
+        "[red]d[/red] <id> delete   "
+        "[cyan]s[/cyan] <id> split   "
+        "[magenta]n[/magenta] new node"
+    )
+    console.print(
+        "  [bold]Contract:[/bold] "
+        "[yellow]ec[/yellow] <id> edit assertion   "
+        "[red]dc[/red] <id> delete   "
+        "[cyan]ep[/cyan] <id> edit priority   "
+        "[magenta]nc[/magenta] new criterion"
+    )
+    console.print(
+        "  [bold]Other:[/bold]    "
+        "[dim]l[/dim] list   "
+        "[dim]h[/dim] help   "
+        "[red]q[/red] quit"
     )
 
 
-# ---------- Clarify round handling ----------
+# ---------- Architect Report rendering + pick collection ----------
 
-def _format_clarify(result: dict) -> str:
-    """Pretty-print a clarify response and capture user answer.
+AGENT_SHORT = {
+    "SecurityAgent":    "Sec",
+    "TestingAgent":     "Test",
+    "DeliveryAgent":    "Del",
+    "UIUXAgent":        "UIUX",
+    "PerformanceAgent": "Perf",
+}
 
-    Returns the user's answer text (possibly multi-line collapsed) which the
-    caller injects into the second-pass prompt.
+PRIORITY_STARS_SUGGESTION = {"high": "★★★", "medium": "★★ ", "low":  "★  "}
+PRIORITY_STARS_CRITERION  = {"must_have": "★★★", "should_have": "★★ ", "nice_to_have": "★  "}
+PRIORITY_COLOR_CRITERION  = {"must_have": "red", "should_have": "yellow", "nice_to_have": "dim white"}
+
+
+def _short(name: str) -> str:
+    return AGENT_SHORT.get(name, name)
+
+
+def _render_architect_report(report: dict) -> None:
     """
-    reason = result["reason"]
+    Show the consolidated expert output. Always rendered, even when
+    clarify_questions is empty — demo signal that the multi-expert
+    intelligence happened.
+    """
+    summaries  = report.get("expert_summaries", {})
+    questions  = report.get("clarify_questions", [])
+    suggestions = report.get("design_suggestions", [])
+    criteria   = report.get("draft_criteria", [])
+
     console.print()
     console.print(Panel.fit(
-        f"[bold yellow]Architect needs clarification[/bold yellow]   "
-        f"[dim](reason: {reason})[/dim]\n\n"
-        f"[dim]{result['reasoning']}[/dim]",
-        border_style="yellow",
+        f"[bold]Architect Report[/bold]   "
+        f"[dim]({len(summaries)} experts · {len(questions)} questions · "
+        f"{len(suggestions)} suggestions · {len(criteria)} draft criteria)[/dim]",
+        border_style="cyan",
     ))
 
-    if result.get("questions"):
-        console.print("\n  [bold]Questions:[/bold]")
-        for i, q in enumerate(result["questions"], 1):
-            console.print(f"    [yellow]Q{i}.[/yellow] {q}")
+    # Expert summaries — short attribution + one-line take
+    if summaries:
+        console.print("\n  [bold]Expert perspectives[/bold]")
+        for agent, summary in summaries.items():
+            console.print(f"    [cyan]{_short(agent):<5}[/cyan] {summary}")
 
-    if result.get("narrow_options"):
-        console.print("\n  [bold]Pick one (or rephrase):[/bold]")
-        for i, o in enumerate(result["narrow_options"], 1):
-            console.print(f"    [cyan]{i}.[/cyan] {o}")
+    # Clarify questions
+    if questions:
+        console.print("\n  [bold]Clarify questions[/bold]")
+        for q in questions:
+            owners = ", ".join(_short(o) for o in q.get("owners", []))
+            console.print(f"    [yellow]{q['id']}[/yellow] [dim]\\[{owners}][/dim]")
+            console.print(f"        {q.get('question', '')}")
+    else:
+        console.print("\n  [dim]No clarify questions — experts have enough context.[/dim]")
 
-    # NOTE: square-bracket tokens like "[q]" are interpreted as Rich markup;
-    # use escaped brackets so they render as literal text.
+    # Design suggestions grouped by priority
+    if suggestions:
+        console.print("\n  [bold]Design suggestions[/bold]")
+        for s in suggestions:
+            stars = PRIORITY_STARS_SUGGESTION.get(s["priority"], "    ")
+            owner = _short(s["owner_agent"])
+            console.print(
+                f"    [yellow]{s['id']}[/yellow] {stars} "
+                f"[dim]\\[{owner}/{s.get('category', '')}][/dim] "
+                f"{s.get('suggestion', '')}"
+            )
+
+    # Draft contract preview (first 5 criteria for brevity in the report)
+    if criteria:
+        console.print(
+            f"\n  [bold]Draft contract preview[/bold] "
+            f"[dim](full {len(criteria)} criteria shown after planning)[/dim]"
+        )
+        for c in criteria[:5]:
+            stars = PRIORITY_STARS_CRITERION.get(c["priority"], "    ")
+            color = PRIORITY_COLOR_CRITERION.get(c["priority"], "white")
+            owner = _short(c["owner_agent"])
+            console.print(
+                f"    [{color}]{c['id']}[/{color}] {stars} "
+                f"[dim]\\[{owner}/{c.get('category', '')}][/dim] "
+                f"{c.get('assertion', '')}"
+            )
+        if len(criteria) > 5:
+            console.print(f"    [dim]…and {len(criteria) - 5} more[/dim]")
+
     console.print(
-        "\n  [dim]Answer on one line, or type a number to pick a narrow "
-        "option. \\[q] to abort.[/dim]"
+        "\n  [dim]Respond with [yellow]q<n>=<answer>[/yellow] for questions "
+        "and [yellow]s<n>[/yellow] to accept suggestions, then end with "
+        "[green]go[/green]. Or [red]cancel[/red] to abort.\n"
+        "  Example:  q1=2000 chars  q2=optional  s1 s2 s3 s5  go[/dim]"
     )
 
-    try:
-        answer = console.input("  > ").strip()
-    except (KeyboardInterrupt, EOFError):
-        return ""
 
-    # If the user typed a number and we have narrow_options, expand it.
-    if answer.isdigit() and result.get("narrow_options"):
-        idx = int(answer) - 1
-        opts = result["narrow_options"]
-        if 0 <= idx < len(opts):
-            return opts[idx]
-    return answer
+# Token shapes:
+#   q<digit>+=<text>   answer to clarify question, text can have spaces if quoted
+#   s<digit>+          accept suggestion id (also written as S1 case-insensitive)
+#   go | proceed       end input, proceed to planning
+#   cancel | quit      abort
 
-
-def _augmented_requirement(original: str, clarify_result: dict, answer: str) -> str:
-    """Build the requirement text sent on the force_plan pass."""
-    parts = [original.strip()]
-    parts.append("")
-    parts.append("Clarification context from user:")
-    if clarify_result.get("questions"):
-        for i, q in enumerate(clarify_result["questions"], 1):
-            parts.append(f"  Q{i}: {q}")
-    parts.append(f"  User answer: {answer}")
-    return "\n".join(parts)
+_TOKEN_Q  = re.compile(r"^q(\d+)=(.*)$", re.IGNORECASE)
+_TOKEN_S  = re.compile(r"^s(\d+)$",       re.IGNORECASE)
+_TOKEN_GO = {"go", "proceed", "g"}
+_TOKEN_CX = {"cancel", "quit", "abort"}
 
 
-def _build_clarify_history(clarify_result: dict, answer: str) -> str:
-    """Prompt-friendly transcript injected on the force_plan pass."""
-    lines = []
-    for q in clarify_result.get("questions", []):
-        lines.append(f"Q: {q}")
-    for o in clarify_result.get("narrow_options", []):
-        lines.append(f"Option: {o}")
-    lines.append(f"User answer: {answer}")
+def _collect_report_picks(report: dict) -> tuple[dict, list[str], bool]:
+    """
+    Read user input for the Architect Report. Supports multiple lines —
+    accumulate until 'go' (or 'cancel') is typed. Empty input on its
+    own line means 'go' implicitly (UX shortcut).
+
+    Returns: (answers: {q_id: text}, accepted_suggestion_ids: [s_id], aborted: bool)
+    """
+    valid_q_ids = {q["id"].lower() for q in report.get("clarify_questions", [])}
+    valid_s_ids = {s["id"].lower() for s in report.get("design_suggestions", [])}
+
+    answers:  dict[str, str] = {}
+    accepted: list[str]      = []
+
+    while True:
+        try:
+            line = console.input("  > ").strip()
+        except (KeyboardInterrupt, EOFError):
+            return {}, [], True
+
+        if not line:
+            return answers, accepted, False
+        if line.lower() in _TOKEN_CX:
+            return {}, [], True
+
+        # Tokenize. First handle q<n>=<rest of line> case where the
+        # answer might contain whitespace (everything after the = up to
+        # the next q<n>= or s<n> or 'go' marker).
+        tokens = _split_picks_line(line)
+        proceed = False
+        for tok in tokens:
+            if tok.lower() in _TOKEN_GO:
+                proceed = True
+                continue
+            if tok.lower() in _TOKEN_CX:
+                return {}, [], True
+            qm = _TOKEN_Q.match(tok)
+            if qm:
+                qid = f"q{qm.group(1)}".lower()
+                if qid in valid_q_ids:
+                    answers[qid] = qm.group(2).strip()
+                else:
+                    console.print(f"  [dim]Ignoring unknown question id: {qid}[/dim]")
+                continue
+            sm = _TOKEN_S.match(tok)
+            if sm:
+                sid = f"s{sm.group(1)}".lower()
+                if sid in valid_s_ids:
+                    if sid not in accepted:
+                        accepted.append(sid)
+                else:
+                    console.print(f"  [dim]Ignoring unknown suggestion id: {sid}[/dim]")
+                continue
+            console.print(f"  [dim]Unrecognized token: {tok!r}[/dim]")
+
+        if proceed:
+            return answers, accepted, False
+
+
+def _split_picks_line(line: str) -> list[str]:
+    """
+    Split a picks line into tokens where q<n>=<answer> captures
+    everything up to the next q<n>= / s<n> / go / cancel marker.
+    Simpler than full quoting; good enough for one-line UX.
+    """
+    boundary = re.compile(
+        r"(?=\bq\d+=)|(?=\bs\d+\b)|(?=\bgo\b)|(?=\bproceed\b)|"
+        r"(?=\bcancel\b)|(?=\bquit\b)|(?=\babort\b)",
+        re.IGNORECASE,
+    )
+    parts = [p.strip() for p in boundary.split(line) if p.strip()]
+    return parts
+
+
+def _build_clarify_history(
+    requirement: str,
+    answers: dict,
+    accepted_suggestions: list[dict],
+) -> str:
+    """
+    Prompt-friendly transcript injected into the final plan() call so the
+    DAG generation respects user-chosen scope.
+    """
+    lines: list[str] = []
+    if answers:
+        lines.append("Clarify Q&A:")
+        for q_id, ans in answers.items():
+            lines.append(f"  {q_id} answer: {ans}")
+    if accepted_suggestions:
+        lines.append("")
+        lines.append("Accepted design suggestions (must be reflected in the DAG):")
+        for s in accepted_suggestions:
+            lines.append(
+                f"  - [{s['priority']}/{s.get('category', '')}] "
+                f"{s.get('suggestion', '')}"
+            )
     return "\n".join(lines)
+
+
+# ---------- Contract rendering + editing ----------
+
+def _render_contract(criteria: list[dict]) -> None:
+    if not criteria:
+        console.print("\n  [dim]Contract is empty.[/dim]")
+        return
+
+    table = Table(box=box.SIMPLE_HEAVY, show_header=True)
+    table.add_column("ID",        style="bold")
+    table.add_column("Priority",  style="white")
+    table.add_column("Owner",     style="cyan")
+    table.add_column("Assertion", style="white", overflow="fold")
+
+    pri_count = {"must_have": 0, "should_have": 0, "nice_to_have": 0}
+    for c in criteria:
+        color = PRIORITY_COLOR_CRITERION.get(c["priority"], "white")
+        pri_count[c["priority"]] = pri_count.get(c["priority"], 0) + 1
+        table.add_row(
+            c["id"],
+            f"[{color}]{c['priority']}[/{color}]",
+            _short(c["owner_agent"]),
+            c.get("assertion", ""),
+        )
+
+    console.print()
+    console.print(Panel.fit(
+        f"[bold]Contract[/bold]   "
+        f"[dim]({len(criteria)} criteria — "
+        f"{pri_count.get('must_have', 0)} must · "
+        f"{pri_count.get('should_have', 0)} should · "
+        f"{pri_count.get('nice_to_have', 0)} nice)[/dim]",
+        border_style="magenta",
+    ))
+    console.print(table)
+
+
+def _delete_criterion(criteria: list[dict], cid: str) -> bool:
+    for i, c in enumerate(criteria):
+        if c["id"] == cid:
+            del criteria[i]
+            return True
+    return False
+
+
+def _edit_criterion_assertion(criteria: list[dict], cid: str) -> bool:
+    for c in criteria:
+        if c["id"] == cid:
+            try:
+                new = console.input(
+                    f"  New assertion for [bold]{cid}[/bold] "
+                    f"(current: {c.get('assertion', '')[:60]}…): "
+                ).strip()
+            except (KeyboardInterrupt, EOFError):
+                return False
+            if new:
+                c["assertion"] = new
+                return True
+            return False
+    return False
+
+
+def _edit_criterion_priority(criteria: list[dict], cid: str) -> bool:
+    for c in criteria:
+        if c["id"] == cid:
+            try:
+                new = console.input(
+                    f"  New priority for [bold]{cid}[/bold] "
+                    f"(current: {c['priority']}) "
+                    f"[must_have | should_have | nice_to_have]: "
+                ).strip()
+            except (KeyboardInterrupt, EOFError):
+                return False
+            if new in ("must_have", "should_have", "nice_to_have"):
+                c["priority"] = new
+                return True
+            console.print("  [red]Invalid priority[/red]")
+            return False
+    return False
+
+
+def _next_criterion_id(criteria: list[dict]) -> str:
+    existing = {c["id"] for c in criteria}
+    i = 1
+    while f"c{i}" in existing:
+        i += 1
+    return f"c{i}"
+
+
+def _add_criterion(criteria: list[dict]) -> bool:
+    try:
+        priority = console.input(
+            "  Priority [must_have | should_have | nice_to_have]: "
+        ).strip() or "should_have"
+        if priority not in ("must_have", "should_have", "nice_to_have"):
+            console.print("  [red]Invalid priority[/red]")
+            return False
+        category  = console.input("  Category (e.g. 'input-validation'): ").strip() or "general"
+        assertion = console.input("  Assertion (testable statement): ").strip()
+        if not assertion:
+            return False
+        rationale = console.input("  Rationale: ").strip()
+        owner     = console.input(
+            "  Owner agent [SecurityAgent | UIUXAgent | TestingAgent | "
+            "PerformanceAgent | DeliveryAgent]: "
+        ).strip() or "SecurityAgent"
+    except (KeyboardInterrupt, EOFError):
+        return False
+
+    cid = _next_criterion_id(criteria)
+    criteria.append({
+        "id":              cid,
+        "priority":        priority,
+        "owner_agent":     owner,
+        "owners":          [owner],
+        "category":        category,
+        "assertion":       assertion,
+        "rationale":       rationale,
+        "suggested_check": "manual",
+    })
+    return True
 
 
 # ---------- Graph editing ----------
@@ -277,15 +543,19 @@ def _add_node(graph: TaskGraph) -> bool:
     return True
 
 
-def _edit_loop(graph: TaskGraph) -> tuple[bool, list[str]]:
+def _edit_loop(
+    graph: TaskGraph,
+    criteria: list[dict] | None = None,
+) -> tuple[bool, list[str]]:
     """
-    Returns (approved, edits) where:
-      approved  True if the user approved (graph should be persisted),
-                False if the user quit without saving.
-      edits     Ordered list of human-readable edit operations the user
-                performed before approval. Used by planning_memory so future
-                builds can mimic the user's preferred decomposition style.
+    Unified edit loop for graph (e/d/s/n) and contract (ec/dc/ep/nc).
+    `criteria` is an optional list (mutated in place) of Contract
+    criteria dicts — when present, contract commands are available.
+
+    Returns (approved, edits) where edits is the ordered list of user
+    actions feeding planning_memory.
     """
+    criteria = criteria if criteria is not None else []
     edits: list[str] = []
     _print_edit_help()
     while True:
@@ -314,10 +584,13 @@ def _edit_loop(graph: TaskGraph) -> tuple[bool, list[str]]:
             return False, edits
         if cmd in ("l", "list"):
             _render_graph(graph)
+            _render_contract(criteria)
             continue
         if cmd in ("h", "help", "?"):
             _print_edit_help()
             continue
+
+        # ----- Graph editing -----
         if cmd == "e":
             if not arg:
                 console.print("  [dim]Usage: e <node_id>[/dim]")
@@ -366,6 +639,55 @@ def _edit_loop(graph: TaskGraph) -> tuple[bool, list[str]]:
                 console.print(f"  [red]Add cancelled[/red]")
             continue
 
+        # ----- Contract editing -----
+        if cmd == "ec":
+            if not arg:
+                console.print("  [dim]Usage: ec <criterion_id>[/dim]")
+                continue
+            ok = _edit_criterion_assertion(criteria, arg)
+            if ok:
+                edits.append(f"edited criterion {arg}")
+                console.print(f"  [green]✓ criterion {arg} assertion updated[/green]")
+                _render_contract(criteria)
+            else:
+                console.print(f"  [red]Could not edit criterion {arg}[/red]")
+            continue
+        if cmd == "dc":
+            if not arg:
+                console.print("  [dim]Usage: dc <criterion_id>[/dim]")
+                continue
+            ok = _delete_criterion(criteria, arg)
+            if ok:
+                edits.append(f"deleted criterion {arg}")
+                console.print(f"  [green]✓ criterion {arg} deleted[/green]")
+                _render_contract(criteria)
+            else:
+                console.print(f"  [red]Criterion {arg} not found[/red]")
+            continue
+        if cmd == "ep":
+            if not arg:
+                console.print("  [dim]Usage: ep <criterion_id>[/dim]")
+                continue
+            ok = _edit_criterion_priority(criteria, arg)
+            if ok:
+                edits.append(f"changed priority of {arg}")
+                console.print(f"  [green]✓ {arg} priority updated[/green]")
+                _render_contract(criteria)
+            else:
+                console.print(f"  [red]Could not update priority for {arg}[/red]")
+            continue
+        if cmd == "nc":
+            before = len(criteria)
+            ok = _add_criterion(criteria)
+            if ok and len(criteria) > before:
+                new_id = criteria[-1]["id"]
+                edits.append(f"added criterion {new_id}")
+                console.print(f"  [green]✓ added criterion {new_id}[/green]")
+                _render_contract(criteria)
+            else:
+                console.print(f"  [red]Add criterion cancelled[/red]")
+            continue
+
         console.print(f"  [dim]Unknown command: {cmd}. Try 'h' for help.[/dim]")
 
 
@@ -402,91 +724,139 @@ async def _cmd_build_inner(requirement: str) -> None:
         border_style="blue",
     ))
 
-    # Track clarify trace for planning_memory write-back.
-    needed_clarify  = False
-    clarify_record  = ""
-
-    # ---------- Planner pass 1 ----------
-    with console.status("[bold blue]Planning task graph...[/bold blue]"):
+    # ---------- Stage 1: plan_with_experts ----------
+    with console.status("[bold blue]Running expert agents in parallel...[/bold blue]"):
         try:
-            result = await plan(requirement, repo_profile)
+            pwe = await plan_with_experts(requirement, repo_profile)
         except Exception as e:
-            console.print(f"[red]Planner failed: {e}[/red]")
+            console.print(f"[red]Expert plan phase failed: {e}[/red]")
             return
 
-    # Surface planning_memory hits — demo signal that the system is using
-    # what it learned from past builds.
-    hits = (result.get("memory_injected") or {}).get("planning_hits", 0)
+    if pwe.get("errors"):
+        for agent, err in pwe["errors"].items():
+            console.print(f"  [yellow]⚠ {agent} errored: {err}[/yellow]")
+    if not pwe.get("expert_outputs"):
+        console.print("[red]No expert outputs — cannot synthesize.[/red]")
+        return
+
+    sel = pwe["selection"]
+    console.print(
+        f"  [dim]Experts: {', '.join(_short(n) for n in sel.selected)}[/dim]"
+    )
+
+    # ---------- Stage 2: synthesize_report ----------
+    with console.status("[bold blue]Synthesizing Architect Report...[/bold blue]"):
+        try:
+            report = await synthesize_report(pwe["expert_outputs"], requirement)
+        except Exception as e:
+            console.print(f"[red]Synthesizer failed: {e}[/red]")
+            return
+
+    # ---------- Stage 3: render Architect Report ----------
+    _render_architect_report(report)
+
+    # ---------- Stage 4: collect user picks ----------
+    answers, accepted_ids, aborted = _collect_report_picks(report)
+    if aborted:
+        console.print("\n  [dim]Cancelled at Architect Report step.[/dim]")
+        return
+
+    accepted_suggestions = [
+        s for s in report["design_suggestions"] if s["id"].lower() in {a.lower() for a in accepted_ids}
+    ]
+    console.print(
+        f"  [dim]Picks: {len(answers)} question answer(s), "
+        f"{len(accepted_suggestions)} suggestion(s) accepted[/dim]"
+    )
+
+    needed_clarify = bool(answers or accepted_suggestions)
+    clarify_record = _build_clarify_history(requirement, answers, accepted_suggestions)
+    augmented_req  = requirement
+    if clarify_record:
+        augmented_req = f"{requirement}\n\n{clarify_record}"
+
+    # ---------- Stage 5: plan() for final DAG ----------
+    with console.status("[bold blue]Generating task graph...[/bold blue]"):
+        try:
+            # force_plan=True so the planner cannot ask for clarification —
+            # the Architect Report already handled that.
+            plan_result = await plan(
+                augmented_req,
+                repo_profile,
+                force_plan=True,
+                clarify_history=clarify_record,
+            )
+        except Exception as e:
+            console.print(f"[red]DAG planner failed: {e}[/red]")
+            return
+
+    if plan_result["action"] != "plan":
+        console.print(
+            "[red]Planner returned clarify on the force_plan pass — aborting.[/red]"
+        )
+        return
+
+    hits = (plan_result.get("memory_injected") or {}).get("planning_hits", 0)
     if hits:
         console.print(
             f"  [dim]Planner memory: {hits} similar past build(s) "
             f"retrieved into the prompt[/dim]"
         )
 
-    # ---------- Clarify round (at most once) ----------
-    if result["action"] == "clarify":
-        needed_clarify = True
-        answer = _format_clarify(result)
-        if not answer or answer.lower() == "q":
-            console.print("\n  [dim]Aborted at clarify step.[/dim]")
-            return
-        clarify_record = _build_clarify_history(result, answer)
-
-        with console.status("[bold blue]Re-planning with your answers...[/bold blue]"):
-            try:
-                result = await plan(
-                    _augmented_requirement(requirement, result, answer),
-                    repo_profile,
-                    force_plan=True,
-                    clarify_history=clarify_record,
-                )
-            except Exception as e:
-                console.print(f"[red]Planner failed on force_plan pass: {e}[/red]")
-                return
-
-        if result["action"] != "plan":
-            console.print(
-                "[red]Planner returned clarify on force_plan pass — aborting.[/red]"
-            )
-            return
-
-    # ---------- Construct TaskGraph ----------
+    # ---------- Stage 6: construct + render Graph + Contract ----------
     graph_id = f"GRAPH-{uuid.uuid4().hex[:8]}"
     graph = TaskGraph(
         graph_id=graph_id,
         root_requirement=requirement,
-        nodes=[TaskNode(**n) for n in result["graph"]["nodes"]],
+        nodes=[TaskNode(**n) for n in plan_result["graph"]["nodes"]],
         created_at=datetime.now().isoformat(),
     )
 
+    # Start contract from synth's draft_criteria.
+    criteria = [dict(c) for c in report.get("draft_criteria", [])]
+
     _render_graph(graph)
-    if result.get("reasoning"):
-        console.print(f"  [dim]Planner reasoning:[/dim] {result['reasoning']}")
-    console.print()
+    if plan_result.get("reasoning"):
+        console.print(f"  [dim]Planner reasoning:[/dim] {plan_result['reasoning']}")
+    _render_contract(criteria)
 
-    # ---------- Edit loop ----------
-    approved, edits = _edit_loop(graph)
-
+    # ---------- Stage 7: unified edit loop ----------
+    approved, edits = _edit_loop(graph, criteria)
     if not approved:
-        console.print("\n  [dim]Graph discarded — not saved.[/dim]")
+        console.print("\n  [dim]Graph + contract discarded — not saved.[/dim]")
         return
 
-    # ---------- Persist graph ----------
+    # ---------- Stage 8: persist + planning_memory write-back ----------
+    contract = Contract(
+        contract_id = f"CON-{uuid.uuid4().hex[:8]}",
+        graph_id    = graph_id,
+        criteria    = [Criterion(**c) for c in criteria],
+        created_at  = datetime.now().isoformat(),
+    )
+    graph.contract = contract
+
     payload = graph.model_dump()
     payload["approved"] = True
     await save_graph(payload)
 
-    # ---------- Reflection write-back to planning_memory ----------
-    # Every approved build becomes a training signal for future builds:
-    # similar requirements pull this trace forward, and edits the user
-    # made nudge the next planner output toward the same shape.
+    # Reflection: each approved build feeds future ones. Include
+    # contract summary in the document so future similar builds can
+    # retrieve "this kind of feature usually has N must-haves".
     node_types = [n.type for n in graph.nodes]
+    contract_summary = (
+        f"Contract: {len(criteria)} criteria — "
+        f"{sum(1 for c in criteria if c['priority']=='must_have')} must_have, "
+        f"{sum(1 for c in criteria if c['priority']=='should_have')} should_have, "
+        f"{sum(1 for c in criteria if c['priority']=='nice_to_have')} nice_to_have. "
+        f"Owners: {sorted({c['owner_agent'] for c in criteria})}"
+    )
+
     try:
         add_plan(
             plan_id        = graph_id,
             requirement    = requirement,
             needed_clarify = needed_clarify,
-            clarify_qa     = clarify_record,
+            clarify_qa     = (clarify_record + "\n" + contract_summary).strip(),
             node_count     = len(graph.nodes),
             node_types     = node_types,
             edits          = edits,
@@ -500,7 +870,8 @@ async def _cmd_build_inner(requirement: str) -> None:
     console.print(Panel.fit(
         f"[green]✓ Saved as {graph_id}[/green]   "
         f"[dim]({len(graph.nodes)} nodes, "
-        f"{sum(len(n.dependencies) for n in graph.nodes)} edges)[/dim]\n"
+        f"{sum(len(n.dependencies) for n in graph.nodes)} edges, "
+        f"{len(criteria)} contract criteria)[/dim]\n"
         f"[dim]{memory_msg} "
         f"({stats.get('planning_in_memory', 0)} total plans in memory)[/dim]",
         border_style="green",

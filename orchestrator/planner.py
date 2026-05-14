@@ -366,3 +366,231 @@ async def plan_with_experts(
         "expert_outputs": expert_outputs,
         "errors":         errors,
     }
+
+
+# ===================================================================
+# P4 Chunk C — Synthesizer
+# ===================================================================
+# Single LLM call that consolidates 5 expert outputs into a
+# triage-ready Architect Report. Semantic dedup ("sanitize XSS" ≈
+# "escape HTML on render"), priority reconciliation when experts
+# disagree, and polished assertion text in one pass.
+
+def _flatten_experts_for_synth(expert_outputs: dict) -> dict:
+    """Pass synth only the actionable fields, not debug metadata."""
+    flat = {}
+    for agent_name, output in expert_outputs.items():
+        flat[agent_name] = {
+            "perspective_summary": output.get("perspective_summary", ""),
+            "clarify_questions":   output.get("clarify_questions", []),
+            "design_suggestions":  [
+                {k: s.get(k, "")
+                 for k in ("priority", "category", "suggestion", "rationale")}
+                for s in output.get("design_suggestions", []) or []
+            ],
+            "proposed_criteria":   [
+                {k: c.get(k, "")
+                 for k in ("priority", "category", "assertion", "rationale", "suggested_check")}
+                for c in output.get("proposed_criteria", []) or []
+            ],
+        }
+    return flat
+
+
+def _build_synth_prompt(requirement: str, flat_experts: dict) -> str:
+    payload = json.dumps(flat_experts, indent=2)
+    agent_names = list(flat_experts.keys())
+
+    return f"""You are a project lead synthesizing input from {len(agent_names)} expert reviewers into a single Architect Report for a developer to triage.
+
+## Original requirement
+{requirement}
+
+## Expert outputs (raw)
+The following JSON contains each expert's perspective, clarify questions,
+design suggestions, and proposed contract criteria. Experts: {", ".join(agent_names)}.
+
+```json
+{payload}
+```
+
+## Your job
+Consolidate these into ONE report with:
+
+1. **expert_summaries** — keep each expert's perspective_summary verbatim.
+
+2. **clarify_questions** — merge near-duplicates across experts. If two
+   experts asked the same underlying question (even worded differently),
+   merge into one with `owners` listing all the asking agents. Aim for
+   3–5 final questions. Each MUST be answerable in one short response.
+
+3. **design_suggestions** — merge near-duplicates (semantic, not just
+   string match). Keep priority high/medium/low from the original
+   experts; when experts disagree on priority for a merged item, pick
+   the HIGHER one. Tag `owner_agent` for single-owner suggestions or
+   `owners` list for multi-owner. Sort: high first, then medium, then
+   low. Aim for 8–12 final suggestions.
+
+4. **draft_criteria** — same dedup pattern. Priority winner is the
+   higher of must_have > should_have > nice_to_have. Polish the
+   `assertion` so it reads like a contract clause: testable, specific,
+   no platitudes. Aim for 10–15 final criteria.
+
+## Output format
+Return JSON in EXACTLY this structure (no preamble, no markdown fence):
+
+{{
+  "expert_summaries": {{
+    "AgentName": "their perspective_summary verbatim",
+    ...
+  }},
+  "clarify_questions": [
+    {{
+      "id": "q1",
+      "owners": ["AgentName1", "AgentName2"],
+      "question": "Polished question"
+    }}
+  ],
+  "design_suggestions": [
+    {{
+      "id": "s1",
+      "priority": "high|medium|low",
+      "owner_agent": "AgentName",
+      "owners": ["AgentName1", "AgentName2"],
+      "category": "short-tag",
+      "suggestion": "Polished one-sentence improvement",
+      "rationale": "Why this matters"
+    }}
+  ],
+  "draft_criteria": [
+    {{
+      "id": "c1",
+      "priority": "must_have|should_have|nice_to_have",
+      "owner_agent": "AgentName",
+      "owners": ["AgentName1", "AgentName2"],
+      "category": "short-tag",
+      "assertion": "A verifiable statement, e.g. 'notes field has @Size(max <= 2000)'.",
+      "rationale": "Why",
+      "suggested_check": "static-analysis|runtime-test|manual"
+    }}
+  ]
+}}
+
+`owners` and `owner_agent` rules:
+- Single-owner item → `owner_agent: "X"`, `owners: ["X"]`
+- Multi-owner (deduped from N experts) → `owner_agent: <pick the most natural owner>`, `owners: [all contributors]`
+"""
+
+
+def _validate_synth_result(data: dict, raw: str, stop_reason: str) -> dict:
+    """Normalize and lightly validate synth output. Errors-out only on
+    structural failures; soft-coerces priority enums and missing fields."""
+    if not isinstance(data, dict):
+        raise ValueError("Synthesizer did not return a JSON object")
+
+    def _norm_question(i: int, q: dict) -> dict:
+        return {
+            "id":       q.get("id", f"q{i+1}"),
+            "owners":   [o for o in (q.get("owners") or []) if isinstance(o, str)],
+            "question": str(q.get("question", "")).strip(),
+        }
+
+    def _norm_suggestion(i: int, s: dict) -> dict:
+        priority = s.get("priority", "medium")
+        if priority not in ("high", "medium", "low"):
+            priority = "medium"
+        owners = [o for o in (s.get("owners") or []) if isinstance(o, str)]
+        owner_agent = s.get("owner_agent") or (owners[0] if owners else "")
+        return {
+            "id":          s.get("id", f"s{i+1}"),
+            "priority":    priority,
+            "owner_agent": owner_agent,
+            "owners":      owners or ([owner_agent] if owner_agent else []),
+            "category":    s.get("category", "general"),
+            "suggestion":  str(s.get("suggestion", "")).strip(),
+            "rationale":   str(s.get("rationale", "")).strip(),
+        }
+
+    def _norm_criterion(i: int, c: dict) -> dict:
+        priority = c.get("priority", "should_have")
+        if priority not in ("must_have", "should_have", "nice_to_have"):
+            priority = "should_have"
+        owners = [o for o in (c.get("owners") or []) if isinstance(o, str)]
+        owner_agent = c.get("owner_agent") or (owners[0] if owners else "")
+        return {
+            "id":               c.get("id", f"c{i+1}"),
+            "priority":         priority,
+            "owner_agent":      owner_agent,
+            "owners":           owners or ([owner_agent] if owner_agent else []),
+            "category":         c.get("category", "general"),
+            "assertion":        str(c.get("assertion", "")).strip(),
+            "rationale":        str(c.get("rationale", "")).strip(),
+            "suggested_check":  c.get("suggested_check", "manual"),
+        }
+
+    questions = [_norm_question(i, q) for i, q in enumerate(data.get("clarify_questions", []) or []) if isinstance(q, dict)]
+    suggestions = [_norm_suggestion(i, s) for i, s in enumerate(data.get("design_suggestions", []) or []) if isinstance(s, dict)]
+    criteria = [_norm_criterion(i, c) for i, c in enumerate(data.get("draft_criteria", []) or []) if isinstance(c, dict)]
+
+    return {
+        "expert_summaries":   dict(data.get("expert_summaries", {})),
+        "clarify_questions":  questions,
+        "design_suggestions": suggestions,
+        "draft_criteria":     criteria,
+        "_raw_response":      raw[:6000],
+        "_stop_reason":       stop_reason,
+    }
+
+
+async def synthesize_report(
+    expert_outputs: dict,
+    requirement: str,
+    max_tokens: int = 8000,
+) -> dict:
+    """
+    LLM-driven synthesis: ingest the 5 expert outputs and produce a
+    triage-ready Architect Report (one consolidated payload). One LLM
+    call, structured output, semantic dedupe.
+
+    Returns:
+        {
+          "expert_summaries":   {agent_name: summary},
+          "clarify_questions":  [{id, owners, question}, ...],
+          "design_suggestions": [{id, priority, owner_agent, owners, category, suggestion, rationale}, ...],
+          "draft_criteria":     [{id, priority, owner_agent, owners, category, assertion, rationale, suggested_check}, ...],
+          "_raw_response":      raw LLM text (truncated, debug)
+          "_stop_reason":       end_turn | max_tokens | ...
+        }
+    """
+    if not expert_outputs:
+        # Nothing to synthesize — return an empty report rather than
+        # making a wasted LLM call.
+        return {
+            "expert_summaries":   {},
+            "clarify_questions":  [],
+            "design_suggestions": [],
+            "draft_criteria":     [],
+            "_raw_response":      "",
+            "_stop_reason":       "skipped_empty_input",
+        }
+
+    flat = _flatten_experts_for_synth(expert_outputs)
+    prompt = _build_synth_prompt(requirement, flat)
+
+    response = await client.messages.create(
+        model=MODEL,
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = response.content[0].text
+    stop_reason = response.stop_reason
+
+    try:
+        data = json.loads(_strip_fences(raw))
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Synthesizer returned non-JSON output "
+            f"(stop_reason={stop_reason}): {raw[:300]}..."
+        ) from e
+
+    return _validate_synth_result(data, raw, stop_reason)
