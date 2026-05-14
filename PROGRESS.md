@@ -164,7 +164,7 @@ The plan in §4 addresses missing items either by building them or explicitly di
 
 ## 4. Work plan — May 14–18
 
-> **Cursor:** §6 Priority 2, first task = `models.py — add TaskNode`. P1 hard-blockers (§12 verification + Day 3 commit) are done. **P1 docs and wrap-up (requirements.txt / README / design doc additions / final §5.3 test cases) are intentionally deferred to after P2/P3/P4** so the core thematic feature work gets the bulk of remaining time; we'll backfill docs informed by what actually got built. Before writing P2 code, surface §6.2's "Decision before coding" (single-pass breakdown vs multi-turn conversation).
+> **Cursor:** §6.2 Breakdown chunk 2 — `planning_memory` collection in `memory/vector_store.py`, planner.py memory injection, `cli/build_cmd.py` reflection write-back. P2 chunk 1 (data layer + planner + build CLI + clarify gate) landed 2026-05-14, end-to-end verified twice on petclinic. P1 docs / wrap-up still deferred to end.
 >
 > *Update this line as work progresses. Claude Code reads this on every "continue" request to find the next task.*
 
@@ -256,25 +256,25 @@ The walk-through follow-up is live — so **demoability of the end-to-end exampl
 ### 6.2 Tasks
 
 **Core data structures**
-- [ ] `models.py` — add `TaskNode` (id, type ∈ {frontend / backend / test / migration / review}, description, dependencies, status, artifacts, optional pr_number)
-- [ ] `models.py` — add `TaskGraph` (nodes, edges, root_requirement, current_node_id)
-- [ ] `database.py` — add `task_graphs` table + CRUD (`save_graph` / `load_graph` / `update_node_status`)
+- [x] `models.py` — `TaskNode` (id, type, description, dependencies, status, artifacts, optional pr_number). Done 2026-05-14. Pydantic v2, str-comment enum style consistent with existing models.
+- [x] `models.py` — `TaskGraph` (graph_id, root_requirement, nodes, current_node_id, created_at). `edges` is a derived `@property` from `node.dependencies` — single source of truth, never stored. Done 2026-05-14.
+- [x] `database.py` — `task_graphs` table + `save_graph` (upsert) / `load_graph` / `list_graphs` / `update_node_status` CRUD. Nodes serialized as JSON in `nodes_json` (graphs are small enough that a normalized table isn't worth it). Done 2026-05-14, 10 smoke-test assertions pass.
 
 **Breakdown**
-- [ ] New `orchestrator/planner.py` — input: natural-language requirement + repo_profile + planning_memory; output: `TaskGraph` or a clarify response
-- [ ] LLM prompt — output must be a DAG (not flat list), with explicit dependency edges
-- [ ] Breakdown must produce typical node mix: frontend, backend, test, migration
-- [ ] **Clarify gate** — planner returns either `{"action": "plan", "graph": {...}}` or `{"action": "clarify", "reason": "too_vague|too_complex|ambiguous_target", "questions": [...], "narrow_options": [...]}`. CLI handles a single follow-up (collect user answers / option pick) and re-invokes planner with the augmented prompt, this time requiring `action == "plan"` (no recursive clarify allowed — guarantees the state machine is bounded).
-- [ ] **`memory/vector_store.py`** — add 4th collection `planning_memory` + helpers `add_plan(plan_id, requirement, clarify_qa, final_graph_summary, user_edits, approved)` and `query_relevant_plans(query_text, top_k=3)`. Same time-decay pattern as the existing three layers.
-- [ ] **planner.py memory injection** — before the LLM call, query `planning_memory` semantically against the new requirement, format top-K hits ("past requirement X → no clarify, 5-node DAG; user split backend by layer") into the prompt context. Goal: similar future requirements need fewer / no clarify rounds.
-- [ ] **`cli/build_cmd.py` reflection write-back** — on approve, capture (raw requirement, clarify Q&A if any, final node count + types, ordered list of user edits made, approved flag) and call `add_plan(...)`. Each approved build becomes a training signal for future builds.
+- [x] New `orchestrator/planner.py` — takes NL requirement + repo_profile; returns dict with `action` ∈ {`plan`, `clarify`}. Cold-runs (planning_memory injection wired in chunk 2). Done 2026-05-14.
+- [x] LLM prompt — output is a DAG with explicit dependency edges; topology rules in the prompt (migration before backend, tests follow target, etc.).
+- [x] Breakdown produces typical node mix: verified on petclinic with concrete notes-field requirement → 6 nodes spanning migration / backend / backend-test / frontend / frontend-test.
+- [x] **Clarify gate** — planner returns `{"action": "plan", "graph": {...}}` or `{"action": "clarify", "reason", "questions", "narrow_options"}`. CLI collects one round of answers and re-invokes with `force_plan=True` (validator rejects a recursive clarify, so the state machine is bounded). End-to-end verified twice (concrete → direct plan; vague → clarify too_vague → answer → plan).
+- [ ] **`memory/vector_store.py`** — add 4th collection `planning_memory` + helpers `add_plan(plan_id, requirement, clarify_qa, final_graph_summary, user_edits, approved)` and `query_relevant_plans(query_text, top_k=3)`. Same time-decay pattern as the existing three layers. *(chunk 2)*
+- [ ] **planner.py memory injection** — before the LLM call, query `planning_memory` semantically and format top-K hits into the prompt context. *(chunk 2)*
+- [ ] **`cli/build_cmd.py` reflection write-back** — on approve, call `add_plan(...)` with (raw requirement, clarify Q&A if any, final graph summary, ordered list of user edits, approved flag). *(chunk 2)*
 
 **Human-in-the-loop interaction**
-- [ ] New `cli/build_cmd.py` — interactive `build "<requirement>"`
-- [ ] Display generated `TaskGraph` (tree or table)
-- [ ] Node-level operations: approve / edit / split / merge / delete
-- [ ] **Decision before coding:** single-pass breakdown + edit (1 day) vs multi-turn design conversation (3 days). Default to single-pass.
-- [ ] Persist confirmed graph
+- [x] New `cli/build_cmd.py` — interactive `build "<requirement>"`. Done 2026-05-14.
+- [x] Display generated `TaskGraph` as a Rich table with type colors + "Depends on" column.
+- [x] Node-level operations: approve (`a`) / edit (`e <id>`) / delete (`d <id>` + cascade-clean deps) / split (`s <id>` into N linear parts) / new (`n`). `merge` not implemented — `split + edit` covers the same intent.
+- [x] **Decision before coding:** single-pass + 0-1 turn clarify gate (chosen 2026-05-14 after walking through risk vs UX trade-offs; multi-turn deferred to chunk-2-style design discussion in design doc).
+- [x] Persist confirmed graph — `save_graph(graph_id, ..., approved=True)` on `a`; empty-graph approve is guarded with an error message and continues the loop.
 
 **Advance engine** *(stretch — conservative cut: design only, document in design doc as future work)*
 - [ ] `orchestrator/graph_runner.py` — topological sort, pick next ready node, execute, update status
@@ -294,29 +294,29 @@ The walk-through follow-up is live — so **demoability of the end-to-end exampl
 ### 6.3 Test cases for verification
 
 **Breakdown correctness**
-- [ ] `build "add a notes field to Pet entity"` produces a graph with at least 3 distinct node types (backend + frontend + test minimum)
-- [ ] The breakdown DAG has no cycles (topological sort succeeds)
-- [ ] Backend node is a dependency of frontend node (frontend depends on backend API existing first)
-- [ ] Migration node is a dependency of backend node
-- [ ] Test node depends on the code it tests (backend test depends on backend node, etc.)
+- [x] `build "add a notes field to Pet entity"` produces a graph with at least 3 distinct node types — verified 2026-05-14 with `GRAPH-4916d82d`: 5 distinct types in 6 nodes (migration / backend / backend-test / frontend / frontend-test).
+- [x] The breakdown DAG has no cycles — verified, linear topology n1→n2→{n3,n4,n5}→n6.
+- [x] Backend node is a dependency of frontend node — n5 (frontend) depends on n3 (backend).
+- [x] Migration node is a dependency of backend node — n2 depends on n1.
+- [x] Test node depends on the code it tests — n4 (backend-test) → n3, n6 (frontend-test) → n5.
 
 **Human-in-loop interaction**
-- [ ] User can delete a node in shell and the deleted node disappears from re-rendered graph
-- [ ] User can edit a node's description in shell and the new description persists after re-rendering
-- [ ] Approving a graph writes it to the `task_graphs` table; reopening the shell and querying retrieves the same graph
-- [ ] Approving an empty graph (all nodes deleted) fails gracefully with a clear error
+- [ ] User can delete a node in shell and the deleted node disappears from re-rendered graph *(code path written; not yet exercised by an interactive smoke test)*
+- [ ] User can edit a node's description in shell and the new description persists after re-rendering *(same)*
+- [x] Approving a graph writes it to `task_graphs`; reopening retrieves the same graph — verified 2026-05-14 (two builds end-to-end, `list_graphs()` returns both with `approved=1`, `load_graph()` reconstructs nodes + dependencies intact).
+- [x] Approving an empty graph fails gracefully — guard added in `_edit_loop`: "Cannot approve an empty graph" message + continue.
 
 **Persistence**
-- [ ] Two `build` calls produce two distinct rows in `task_graphs` with unique IDs
-- [ ] Loading a saved graph reconstructs all node attributes and edges intact
+- [x] Two `build` calls produce two distinct rows in `task_graphs` with unique IDs — verified 2026-05-14: `GRAPH-4916d82d` ("notes field to Pet") and `GRAPH-91e4f463` ("improve the pet form").
+- [x] Loading a saved graph reconstructs all node attributes and edges intact — verified at both model layer (JSON roundtrip) and DB layer (`load_graph` + `TaskGraph(**)` reconstruction preserves the `edges` property).
 
 **Clarify gate + planning memory** *(new)*
-- [ ] Vague input (e.g., `build "improve the pet form"`) triggers `action: "clarify"` with `reason == "too_vague"` and ≥ 2 concrete questions referencing actual files / dimensions
-- [ ] Concrete input (e.g., `build "add a notes field to Pet entity, frontend + backend"`) goes straight to `action: "plan"` — no clarify round
-- [ ] Complex input (e.g., `build "rewrite auth, migrate to OAuth, add MFA, update all tests"`) triggers `action: "clarify"` with `reason == "too_complex"` and ≥ 2 `narrow_options`; the chosen option proceeds to a plan
-- [ ] After approving a first `build`, the second `build` with a semantically similar requirement (e.g., first = "add notes to Pet", second = "add notes to Visit") shows ≥ 1 hit retrieved from `planning_memory` in the planner prompt (visible via `logs` / debug output) — i.e., the system remembers
-- [ ] If the user edited the first build's DAG (e.g., split backend node by layer), the second build's initial draft reflects that edit pattern (memory closes the loop on user style)
-- [ ] After 1 approved build, `query_relevant_plans()` returns ≥ 1 result with the expected `requirement_summary` metadata; after 0 builds, returns `[]` without crashing
+- [x] Vague input `"improve the pet form"` triggers `action: "clarify"` with `reason == "too_vague"` and 3 concrete questions referencing real files (PetRestController.java, client/src/components/pets/) — verified 2026-05-14.
+- [x] Concrete input `"add a notes field to Pet entity, both backend and frontend"` goes straight to `action: "plan"` — no clarify round, 6 nodes — verified 2026-05-14.
+- [x] Complex input `"rewrite auth, migrate to OAuth, add MFA, update all tests"` triggers `action: "clarify"` with `reason == "too_complex"` and 3 `narrow_options` each scoped to one build — verified 2026-05-14 at planner level.
+- [ ] After approving a first `build`, the second `build` with a semantically similar requirement shows ≥ 1 hit retrieved from `planning_memory` in the planner prompt — *(chunk 2)*
+- [ ] If the user edited the first build's DAG, the second build's initial draft reflects that edit pattern — *(chunk 2)*
+- [ ] After 1 approved build, `query_relevant_plans()` returns ≥ 1 result with the expected `requirement_summary` metadata; after 0 builds, returns `[]` without crashing — *(chunk 2)*
 
 **Advance engine** *(only if implemented)*
 - [ ] Running the advance engine on a 3-node graph (backend → test → frontend) executes them in topological order, never reverses

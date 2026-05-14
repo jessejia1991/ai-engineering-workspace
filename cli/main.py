@@ -82,6 +82,12 @@ def _interactive_shell():
         elif cmd == "logs":
             task_id = args[0] if args else None
             asyncio.run(_cmd_logs(task_id))
+        elif cmd == "build":
+            # `build "requirement text"` — args are joined and stripped of quotes.
+            joined = raw[len(cmd):].strip()
+            if joined.startswith('"') and joined.endswith('"') and len(joined) >= 2:
+                joined = joined[1:-1]
+            asyncio.run(_cmd_build(joined))
         else:
             console.print(f"[red]Unknown command: {cmd}[/red]")
             _print_help()
@@ -95,6 +101,7 @@ def _print_help():
     table.add_row("review --pr <N>",              "Run multi-agent review on PR #N")
     table.add_row("review --pr <N> --branch <B>", "Review specific branch")
     table.add_row("reflect [task_id]",            "Accept/reject findings, update reflection")
+    table.add_row("build \"<requirement>\"",      "Break a natural-language requirement into a task graph")
     table.add_row("status",                       "Show all tasks and their current state")
     table.add_row("logs <task_id>",               "Show execution log for a task")
     table.add_row("exit",                         "Exit the shell")
@@ -186,6 +193,11 @@ async def _cmd_review(pr_number: int, branch: str = None):
 async def _cmd_reflect(task_id: str = None):
     from cli.reflect_cmd import cmd_reflect
     await cmd_reflect(task_id)
+
+
+async def _cmd_build(requirement: str):
+    from cli.build_cmd import cmd_build
+    await cmd_build(requirement)
 
 
 async def _cmd_logs(task_id: str = None):

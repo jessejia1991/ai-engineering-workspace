@@ -43,6 +43,20 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # P2: task graphs from `build <requirement>` breakdown. Whole graph
+        # serialized as JSON in `nodes_json` (small, self-contained, easy to
+        # version). `approved` distinguishes drafts vs. user-confirmed graphs.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS task_graphs (
+                id               TEXT PRIMARY KEY,
+                root_requirement TEXT,
+                nodes_json       TEXT,
+                current_node_id  TEXT,
+                approved         INTEGER DEFAULT 0,
+                created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
 
 
@@ -208,3 +222,99 @@ async def get_agent_reasoning(task_id: str) -> dict:
         }
 
     return by_agent
+
+
+# ---------- Task graph CRUD (P2) ----------
+
+async def save_graph(graph) -> None:
+    """
+    Upsert a TaskGraph. Accepts either a Pydantic TaskGraph or a dict shaped
+    like one (the CLI may serialize before calling). Whole node list is
+    persisted as JSON in nodes_json — graphs are small and self-contained.
+    """
+    if hasattr(graph, "model_dump"):
+        data = graph.model_dump()
+    else:
+        data = dict(graph)
+
+    nodes_json = json.dumps(data.get("nodes", []))
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO task_graphs
+                (id, root_requirement, nodes_json, current_node_id, approved)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                root_requirement = excluded.root_requirement,
+                nodes_json       = excluded.nodes_json,
+                current_node_id  = excluded.current_node_id,
+                approved         = excluded.approved,
+                updated_at       = CURRENT_TIMESTAMP
+            """,
+            (
+                data["graph_id"],
+                data.get("root_requirement", ""),
+                nodes_json,
+                data.get("current_node_id"),
+                1 if data.get("approved") else 0,
+            ),
+        )
+        await db.commit()
+
+
+async def load_graph(graph_id: str) -> dict | None:
+    """
+    Return a graph as a dict (with nodes parsed back from JSON), or None.
+    Returning a dict instead of a TaskGraph avoids a circular import with
+    models.py and keeps database.py free of pydantic — callers reconstruct.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM task_graphs WHERE id=?", (graph_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            try:
+                d["nodes"] = json.loads(d.pop("nodes_json"))
+            except (json.JSONDecodeError, TypeError):
+                d["nodes"] = []
+            d["graph_id"] = d.pop("id")
+            d["approved"] = bool(d.get("approved"))
+            return d
+
+
+async def list_graphs() -> list[dict]:
+    """Return a summary row per graph (no nodes_json) for shell listing."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT id, root_requirement, current_node_id, approved,
+                      created_at, updated_at
+               FROM task_graphs ORDER BY created_at DESC"""
+        ) as cursor:
+            return [dict(r) for r in await cursor.fetchall()]
+
+
+async def update_node_status(graph_id: str, node_id: str, new_status: str) -> bool:
+    """
+    Update one node's status inside a stored graph. Returns True if the node
+    was found. Done by load → mutate JSON → save_graph, since graphs are
+    small (< 50 nodes). Cheaper than maintaining a normalized nodes table.
+    """
+    g = await load_graph(graph_id)
+    if not g:
+        return False
+    changed = False
+    for n in g["nodes"]:
+        if n.get("id") == node_id:
+            n["status"] = new_status
+            changed = True
+            break
+    if not changed:
+        return False
+    await save_graph(g)
+    return True

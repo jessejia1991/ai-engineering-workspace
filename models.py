@@ -45,3 +45,26 @@ class AgentSelection(BaseModel):
     selected: list[str]
     skipped: dict[str, str]      # agent_name -> reason
     reasoning: dict[str, str]    # agent_name -> why selected
+
+
+class TaskNode(BaseModel):
+    id: str                       # short human-readable, e.g. "n1", "n2a"
+    type: str                     # frontend | backend | test | migration | review
+    description: str
+    dependencies: list[str] = []  # ids of nodes this depends on
+    status: str = "PENDING"       # PENDING | IMPLEMENTING | REVIEWING | AWAITING_HUMAN | MERGED | BLOCKED
+    artifacts: dict = {}          # free-form: file paths, PR url, etc.
+    pr_number: Optional[int] = None
+
+
+class TaskGraph(BaseModel):
+    graph_id: str
+    root_requirement: str
+    nodes: list[TaskNode] = []
+    current_node_id: Optional[str] = None
+    created_at: Optional[str] = None
+
+    @property
+    def edges(self) -> list[tuple[str, str]]:
+        # Derived from node.dependencies — single source of truth, never stored.
+        return [(dep, n.id) for n in self.nodes for dep in n.dependencies]
