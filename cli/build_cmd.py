@@ -25,6 +25,7 @@ from rich import box
 from database import init_db, save_graph
 from scanner.repo_scanner import load_profile
 from orchestrator.planner import plan
+from memory.vector_store import add_plan, get_stats
 from models import TaskNode, TaskGraph
 
 
@@ -275,18 +276,23 @@ def _add_node(graph: TaskGraph) -> bool:
     return True
 
 
-def _edit_loop(graph: TaskGraph) -> bool:
+def _edit_loop(graph: TaskGraph) -> tuple[bool, list[str]]:
     """
-    Returns True if the user approved (graph should be persisted),
-    False if the user quit without saving.
+    Returns (approved, edits) where:
+      approved  True if the user approved (graph should be persisted),
+                False if the user quit without saving.
+      edits     Ordered list of human-readable edit operations the user
+                performed before approval. Used by planning_memory so future
+                builds can mimic the user's preferred decomposition style.
     """
+    edits: list[str] = []
     _print_edit_help()
     while True:
         try:
             raw = console.input("  > ").strip()
         except (KeyboardInterrupt, EOFError):
             console.print("\n  [dim]Aborted.[/dim]")
-            return False
+            return False, edits
 
         if not raw:
             continue
@@ -302,9 +308,9 @@ def _edit_loop(graph: TaskGraph) -> bool:
                     "Add a node with [n] or quit with [q].[/red]"
                 )
                 continue
-            return True
+            return True, edits
         if cmd in ("q", "quit"):
-            return False
+            return False, edits
         if cmd in ("l", "list"):
             _render_graph(graph)
             continue
@@ -317,6 +323,7 @@ def _edit_loop(graph: TaskGraph) -> bool:
                 continue
             ok = _edit_description(graph, arg)
             if ok:
+                edits.append(f"edited {arg}")
                 console.print(f"  [green]✓ {arg} updated[/green]")
                 _render_graph(graph)
             else:
@@ -328,6 +335,7 @@ def _edit_loop(graph: TaskGraph) -> bool:
                 continue
             ok = _delete_node(graph, arg)
             if ok:
+                edits.append(f"deleted {arg}")
                 console.print(f"  [green]✓ {arg} deleted[/green]")
                 _render_graph(graph)
             else:
@@ -339,14 +347,18 @@ def _edit_loop(graph: TaskGraph) -> bool:
                 continue
             ok = _split_node(graph, arg)
             if ok:
+                edits.append(f"split {arg}")
                 console.print(f"  [green]✓ {arg} split[/green]")
                 _render_graph(graph)
             else:
                 console.print(f"  [red]Could not split {arg}[/red]")
             continue
         if cmd == "n":
+            n_before = len(graph.nodes)
             ok = _add_node(graph)
             if ok:
+                new_id = graph.nodes[-1].id if len(graph.nodes) > n_before else "?"
+                edits.append(f"added new node {new_id}")
                 console.print(f"  [green]✓ added new node[/green]")
                 _render_graph(graph)
             else:
@@ -377,6 +389,10 @@ async def cmd_build(requirement: str) -> None:
         border_style="blue",
     ))
 
+    # Track clarify trace for planning_memory write-back.
+    needed_clarify  = False
+    clarify_record  = ""
+
     # ---------- Planner pass 1 ----------
     with console.status("[bold blue]Planning task graph...[/bold blue]"):
         try:
@@ -385,12 +401,23 @@ async def cmd_build(requirement: str) -> None:
             console.print(f"[red]Planner failed: {e}[/red]")
             return
 
+    # Surface planning_memory hits — demo signal that the system is using
+    # what it learned from past builds.
+    hits = (result.get("memory_injected") or {}).get("planning_hits", 0)
+    if hits:
+        console.print(
+            f"  [dim]Planner memory: {hits} similar past build(s) "
+            f"retrieved into the prompt[/dim]"
+        )
+
     # ---------- Clarify round (at most once) ----------
     if result["action"] == "clarify":
+        needed_clarify = True
         answer = _format_clarify(result)
         if not answer or answer.lower() == "q":
             console.print("\n  [dim]Aborted at clarify step.[/dim]")
             return
+        clarify_record = _build_clarify_history(result, answer)
 
         with console.status("[bold blue]Re-planning with your answers...[/bold blue]"):
             try:
@@ -398,7 +425,7 @@ async def cmd_build(requirement: str) -> None:
                     _augmented_requirement(requirement, result, answer),
                     repo_profile,
                     force_plan=True,
-                    clarify_history=_build_clarify_history(result, answer),
+                    clarify_history=clarify_record,
                 )
             except Exception as e:
                 console.print(f"[red]Planner failed on force_plan pass: {e}[/red]")
@@ -425,20 +452,43 @@ async def cmd_build(requirement: str) -> None:
     console.print()
 
     # ---------- Edit loop ----------
-    approved = _edit_loop(graph)
+    approved, edits = _edit_loop(graph)
 
     if not approved:
         console.print("\n  [dim]Graph discarded — not saved.[/dim]")
         return
 
-    # ---------- Persist ----------
+    # ---------- Persist graph ----------
     payload = graph.model_dump()
     payload["approved"] = True
     await save_graph(payload)
 
+    # ---------- Reflection write-back to planning_memory ----------
+    # Every approved build becomes a training signal for future builds:
+    # similar requirements pull this trace forward, and edits the user
+    # made nudge the next planner output toward the same shape.
+    node_types = [n.type for n in graph.nodes]
+    try:
+        add_plan(
+            plan_id        = graph_id,
+            requirement    = requirement,
+            needed_clarify = needed_clarify,
+            clarify_qa     = clarify_record,
+            node_count     = len(graph.nodes),
+            node_types     = node_types,
+            edits          = edits,
+            approved       = True,
+        )
+        memory_msg = "added to planning_memory"
+    except Exception as e:
+        memory_msg = f"planning_memory write FAILED: {e}"
+
+    stats = get_stats()
     console.print(Panel.fit(
         f"[green]✓ Saved as {graph_id}[/green]   "
         f"[dim]({len(graph.nodes)} nodes, "
-        f"{sum(len(n.dependencies) for n in graph.nodes)} edges)[/dim]",
+        f"{sum(len(n.dependencies) for n in graph.nodes)} edges)[/dim]\n"
+        f"[dim]{memory_msg} "
+        f"({stats.get('planning_in_memory', 0)} total plans in memory)[/dim]",
         border_style="green",
     ))

@@ -16,6 +16,7 @@ CHROMA_PATH = os.path.join(
 _client = None
 _findings_collection = None
 _corrections_collection = None
+_planning_collection = None
 _init_lock = threading.RLock()
 
 
@@ -51,6 +52,25 @@ def get_corrections_collection():
                     metadata={"hnsw:space": "cosine"}
                 )
     return _corrections_collection
+
+
+def get_planning_collection():
+    """
+    4th memory layer (P2): every approved `build` invocation deposits a
+    semantically-searchable record of its requirement, clarify Q&A (if any),
+    final node mix, and user edits. Future builds query this layer for
+    similar past requirements to (a) skip unnecessary clarify rounds and
+    (b) inherit decomposition patterns the user previously preferred.
+    """
+    global _planning_collection
+    if _planning_collection is None:
+        with _init_lock:
+            if _planning_collection is None:
+                _planning_collection = get_client().get_or_create_collection(
+                    name="planning_memory",
+                    metadata={"hnsw:space": "cosine"}
+                )
+    return _planning_collection
 
 
 def add_finding(finding_id: str, finding: dict, accepted: bool):
@@ -95,6 +115,96 @@ def add_correction(correction_id: str, note: str, example: str,
             "timestamp": datetime.now().timestamp(),
         }]
     )
+
+
+def add_plan(
+    plan_id: str,
+    requirement: str,
+    needed_clarify: bool,
+    clarify_qa: str,
+    node_count: int,
+    node_types: list[str],
+    edits: list[str],
+    approved: bool,
+):
+    """
+    Record an approved `build` invocation for future planner runs to
+    retrieve. The document text is what gets embedded — make it rich
+    enough that "add notes to Pet" can semantically hit "add notes to
+    Visit" without exact-string overlap.
+    """
+    collection = get_planning_collection()
+
+    parts = [f"Requirement: {requirement}"]
+    if needed_clarify and clarify_qa:
+        parts.append(f"Clarify Q&A: {clarify_qa}")
+    parts.append(f"Plan: {node_count} nodes — {', '.join(node_types) or 'unknown'}")
+    if edits:
+        parts.append(f"User edits: {'; '.join(edits)}")
+    else:
+        parts.append("User edits: none")
+    document = "\n".join(parts)
+
+    # ChromaDB metadata values must be primitives — flatten lists with commas.
+    collection.add(
+        ids=[plan_id],
+        documents=[document],
+        metadatas=[{
+            "requirement":     requirement[:500],
+            "needed_clarify":  bool(needed_clarify),
+            "node_count":      int(node_count),
+            "node_types":      ",".join(node_types),
+            "edits_count":     len(edits),
+            "edits_summary":   "; ".join(edits)[:500],
+            "approved":        bool(approved),
+            "timestamp":       datetime.now().timestamp(),
+        }]
+    )
+
+
+def query_relevant_plans(query_text: str, top_k: int = 3) -> list[dict]:
+    """
+    Semantic search for prior approved builds similar to the current
+    requirement. Returns top-K by similarity with time decay applied.
+    Empty list on first call (planning_memory empty).
+    """
+    collection = get_planning_collection()
+    try:
+        total = collection.count()
+        if total == 0:
+            return []
+        raw = collection.query(
+            query_texts=[query_text],
+            n_results=min(top_k, total),
+        )
+        return _apply_time_decay(raw)
+    except Exception:
+        return []
+
+
+def format_plans_for_prompt(plans: list[dict]) -> str:
+    """
+    Render past-build hits as a compact prompt-friendly block. Returns
+    empty string when there are no hits, so callers can guard with `if`.
+    """
+    if not plans:
+        return ""
+    lines = ["## Past similar builds in this repo"]
+    for p in plans[:3]:
+        meta  = p.get("metadata", {}) or {}
+        req   = meta.get("requirement", "")[:160]
+        nc    = meta.get("node_count", "?")
+        nt    = meta.get("node_types", "")
+        clar  = "clarified first" if meta.get("needed_clarify") else "no clarify"
+        edits = meta.get("edits_summary", "")
+        edits_part = f"; user edits: {edits[:160]}" if edits else ""
+        lines.append(f"- \"{req}\" → {clar}; {nc} nodes ({nt}){edits_part}")
+    lines.append(
+        "\nWhen the current requirement is similar to a past build, follow "
+        "the same node mix — especially edits the user made — unless there "
+        "is a clear reason not to."
+    )
+    return "\n".join(lines)
 
 
 def _apply_time_decay(results: dict, decay_rate: float = 0.05) -> list[dict]:
@@ -218,9 +328,15 @@ def get_stats() -> dict:
     try:
         findings_count    = get_findings_collection().count()
         corrections_count = get_corrections_collection().count()
+        planning_count    = get_planning_collection().count()
         return {
             "findings_in_memory":    findings_count,
             "corrections_in_memory": corrections_count,
+            "planning_in_memory":    planning_count,
         }
     except Exception:
-        return {"findings_in_memory": 0, "corrections_in_memory": 0}
+        return {
+            "findings_in_memory":    0,
+            "corrections_in_memory": 0,
+            "planning_in_memory":    0,
+        }

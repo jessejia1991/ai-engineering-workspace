@@ -164,7 +164,7 @@ The plan in §4 addresses missing items either by building them or explicitly di
 
 ## 4. Work plan — May 14–18
 
-> **Cursor:** §6.2 Breakdown chunk 2 — `planning_memory` collection in `memory/vector_store.py`, planner.py memory injection, `cli/build_cmd.py` reflection write-back. P2 chunk 1 (data layer + planner + build CLI + clarify gate) landed 2026-05-14, end-to-end verified twice on petclinic. P1 docs / wrap-up still deferred to end.
+> **Cursor:** Priority 2 is functionally done (chunks 1 + 2 both landed 2026-05-14, closed-loop verified). Remaining P2 items (`Advance engine`, `Merge abstraction`, `Demo example`) are either marked stretch in §4.3 or are walk-through-time scripting. **Next priority: §8 P4 — multi-agent trade-off review (SynthesizerAgent).** P1 docs / wrap-up still deferred to end.
 >
 > *Update this line as work progresses. Claude Code reads this on every "continue" request to find the next task.*
 
@@ -265,9 +265,9 @@ The walk-through follow-up is live — so **demoability of the end-to-end exampl
 - [x] LLM prompt — output is a DAG with explicit dependency edges; topology rules in the prompt (migration before backend, tests follow target, etc.).
 - [x] Breakdown produces typical node mix: verified on petclinic with concrete notes-field requirement → 6 nodes spanning migration / backend / backend-test / frontend / frontend-test.
 - [x] **Clarify gate** — planner returns `{"action": "plan", "graph": {...}}` or `{"action": "clarify", "reason", "questions", "narrow_options"}`. CLI collects one round of answers and re-invokes with `force_plan=True` (validator rejects a recursive clarify, so the state machine is bounded). End-to-end verified twice (concrete → direct plan; vague → clarify too_vague → answer → plan).
-- [ ] **`memory/vector_store.py`** — add 4th collection `planning_memory` + helpers `add_plan(plan_id, requirement, clarify_qa, final_graph_summary, user_edits, approved)` and `query_relevant_plans(query_text, top_k=3)`. Same time-decay pattern as the existing three layers. *(chunk 2)*
-- [ ] **planner.py memory injection** — before the LLM call, query `planning_memory` semantically and format top-K hits into the prompt context. *(chunk 2)*
-- [ ] **`cli/build_cmd.py` reflection write-back** — on approve, call `add_plan(...)` with (raw requirement, clarify Q&A if any, final graph summary, ordered list of user edits, approved flag). *(chunk 2)*
+- [x] **`memory/vector_store.py`** — 4th collection `planning_memory` + `get_planning_collection` / `add_plan` / `query_relevant_plans` / `format_plans_for_prompt` + `get_stats` extended with `planning_in_memory`. Same time-decay + cosine-similarity pattern as the other three layers. Done 2026-05-14.
+- [x] **planner.py memory injection** — `plan()` cold-queries `planning_memory` for top-3 similar past builds before the LLM call, formats them into a "## Past similar builds" prompt section, and returns `memory_injected.planning_hits` in the result. Done 2026-05-14.
+- [x] **`cli/build_cmd.py` reflection write-back** — `_edit_loop` returns ordered edits (`["edited n2", "deleted n4", "split n1", "added new node n7"]`); on approve, `add_plan(...)` captures (raw requirement, clarify Q&A if any, node count + types, edits, approved flag). Demo signal lines (`Planner memory: N similar past build(s) retrieved` and `added to planning_memory (X total)`) make the loop visible during the build session. Done 2026-05-14.
 
 **Human-in-the-loop interaction**
 - [x] New `cli/build_cmd.py` — interactive `build "<requirement>"`. Done 2026-05-14.
@@ -314,9 +314,9 @@ The walk-through follow-up is live — so **demoability of the end-to-end exampl
 - [x] Vague input `"improve the pet form"` triggers `action: "clarify"` with `reason == "too_vague"` and 3 concrete questions referencing real files (PetRestController.java, client/src/components/pets/) — verified 2026-05-14.
 - [x] Concrete input `"add a notes field to Pet entity, both backend and frontend"` goes straight to `action: "plan"` — no clarify round, 6 nodes — verified 2026-05-14.
 - [x] Complex input `"rewrite auth, migrate to OAuth, add MFA, update all tests"` triggers `action: "clarify"` with `reason == "too_complex"` and 3 `narrow_options` each scoped to one build — verified 2026-05-14 at planner level.
-- [ ] After approving a first `build`, the second `build` with a semantically similar requirement shows ≥ 1 hit retrieved from `planning_memory` in the planner prompt — *(chunk 2)*
-- [ ] If the user edited the first build's DAG, the second build's initial draft reflects that edit pattern — *(chunk 2)*
-- [ ] After 1 approved build, `query_relevant_plans()` returns ≥ 1 result with the expected `requirement_summary` metadata; after 0 builds, returns `[]` without crashing — *(chunk 2)*
+- [x] After approving a first `build`, the second `build` with a semantically similar requirement shows ≥ 1 hit retrieved from `planning_memory` in the planner prompt — verified 2026-05-14: build #1 "add notes to Pet" → build #2 "add notes to Visit, full stack" → `Planner memory: 1 similar past build(s) retrieved`.
+- [x] If the user edited the first build's DAG, the second build's initial draft reflects that edit pattern — verified 2026-05-14: build #1 user deleted both test nodes (n4 + n6) ending at 4 nodes; build #2's initial draft was 4 nodes with NO test nodes, and the planner's own reasoning cited the prior pattern ("Following the same pattern as the 'add notes field to Pet entity' build…").
+- [x] After 1 approved build, `query_relevant_plans()` returns ≥ 1 result; after 0 builds, returns `[]` without crashing — verified in `vector_store` smoke test (similarity 0.563 for related query vs. 0.099 for unrelated, 5× gap shows the embedder is doing useful work).
 
 **Advance engine** *(only if implemented)*
 - [ ] Running the advance engine on a 3-node graph (backend → test → frontend) executes them in topological order, never reverses

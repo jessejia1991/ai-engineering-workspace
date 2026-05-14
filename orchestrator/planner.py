@@ -20,6 +20,7 @@ import os
 import json
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
+from memory.vector_store import query_relevant_plans, format_plans_for_prompt
 
 load_dotenv()
 
@@ -54,7 +55,8 @@ def _repo_profile_snippet(repo_profile: dict) -> str:
 
 
 def _build_prompt(requirement: str, repo_profile: dict, *,
-                  force_plan: bool, clarify_history: str = "") -> str:
+                  force_plan: bool, clarify_history: str = "",
+                  past_plans_text: str = "") -> str:
     valid_types = " | ".join(NODE_TYPES)
     profile = _repo_profile_snippet(repo_profile)
 
@@ -69,6 +71,8 @@ You MUST now return action="plan". Do NOT ask more questions.
     else:
         mode_instructions = ""
 
+    past_section = f"\n{past_plans_text}\n" if past_plans_text else ""
+
     return f"""You are a task breakdown planner for a software engineering codebase.
 
 Given a natural-language requirement and a repo profile, output ONE of:
@@ -77,7 +81,7 @@ Given a natural-language requirement and a repo profile, output ONE of:
 
 ## Repo profile
 {profile}
-
+{past_section}
 ## Requirement
 {requirement}
 
@@ -219,25 +223,37 @@ async def plan(
     force_plan: bool = False,
     clarify_history: str = "",
     max_tokens: int = 4000,
+    use_planning_memory: bool = True,
 ) -> dict:
     """
     Run one planner invocation. Returns a validated dict per _validate_result.
 
     Arguments:
-      requirement      Natural-language requirement from `build "..."`.
-      repo_profile     Output of scan() — used to ground node descriptions.
-      force_plan       True on the second call after a clarify round.
-                       Forbids a recursive clarify response.
-      clarify_history  Human-readable "Q: ... / A: ..." block injected into
-                       the prompt on the force_plan pass.
+      requirement           Natural-language requirement from `build "..."`.
+      repo_profile          Output of scan() — used to ground node descriptions.
+      force_plan            True on the second call after a clarify round.
+                            Forbids a recursive clarify response.
+      clarify_history       Human-readable "Q: ... / A: ..." block injected into
+                            the prompt on the force_plan pass.
+      use_planning_memory   When True, semantically retrieve past approved
+                            builds and inject them. The force_plan pass also
+                            keeps memory (the memory may help the LLM honor
+                            user style across calls).
 
     The caller is responsible for re-invoking with force_plan=True after
     presenting clarify questions to the user.
     """
+    # 4th-layer memory injection: pull semantically-similar past builds so
+    # the planner can skip redundant clarify rounds and follow the user's
+    # established decomposition style.
+    past_plans = query_relevant_plans(requirement, top_k=3) if use_planning_memory else []
+    past_plans_text = format_plans_for_prompt(past_plans)
+
     prompt = _build_prompt(
         requirement, repo_profile,
         force_plan=force_plan,
         clarify_history=clarify_history,
+        past_plans_text=past_plans_text,
     )
 
     response = await client.messages.create(
@@ -257,6 +273,13 @@ async def plan(
         ) from e
 
     result = _validate_result(data, force_plan=force_plan)
-    result["_raw_response"] = raw[:4000]
-    result["_stop_reason"]  = stop_reason
+    result["_raw_response"]    = raw[:4000]
+    result["_stop_reason"]     = stop_reason
+    result["memory_injected"]  = {
+        "planning_hits":   len(past_plans),
+        "planning_titles": [
+            (p.get("metadata", {}) or {}).get("requirement", "")[:120]
+            for p in past_plans
+        ],
+    }
     return result
