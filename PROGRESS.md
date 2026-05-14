@@ -172,7 +172,7 @@ The plan in §4 addresses missing items either by building them or explicitly di
 
 ## 4. Work plan — May 14–18
 
-> **Cursor:** §8 P4 Chunk B (multi-expert plan phase) — first task: `agents/base.py` add abstract `review_requirement(...)` method, then per-agent prompts. P4 Chunk A + P3 (HTTP wrapper) both landed 2026-05-14. Up next: P4 Chunks B → C → D. P1 docs / wrap-up deferred to end.
+> **Cursor:** §8 P4 Chunk C (Synthesizer + Architect Report UX) — first task: `orchestrator/planner.py` add `synthesize_report(expert_outputs, requirement, repo_profile) -> ReportPayload` that bundles clarify Qs + ranked suggestions + draft contract. P4 Chunks A + B and P3 (HTTP wrapper) all landed 2026-05-14. Up next: P4 Chunks C → D. P1 docs / wrap-up deferred to end.
 >
 > *Update this line as work progresses. Claude Code reads this on every "continue" request to find the next task.*
 
@@ -417,11 +417,13 @@ The agentic orchestration layer (`agent_selector`, `planner`, `runner`, `build_c
 - [x] `database.py` — `task_graphs.contract_json` column added; idempotent `ALTER TABLE ADD COLUMN` migration runs in `init_db` for pre-P4 schemas. `save_graph` / `load_graph` serialize and parse contract; absent contract is `None` (not error).
 - [x] Inline smoke test covers: Criterion/Contract construction + helpers; CriterionStatus defaults; AgentFinding.criterion_id optional; full TaskGraph→DB→TaskGraph roundtrip with contract; save/load without contract; 4 existing P2 graphs in workspace.db still load cleanly with contract=None after migration; priority values stay in valid set.
 
-**Chunk B — Multi-expert plan phase (~0.5 day)**
-- [ ] `agents/base.py` — new abstract method `async review_requirement(self, requirement, repo_profile, memory) -> dict` returning `{perspective_summary, clarify_questions, design_suggestions, proposed_criteria}`. Same memory + retry + RLock infra as `review()`.
-- [ ] `agents/{security,uiux,testing,performance}.py` — each implements `review_requirement` with an angle-specific prompt (SecurityAgent asks "what are the attack surfaces / compliance hard-requirements"; UIUXAgent asks "what user impact / accessibility concerns"; TestingAgent asks "what coverage / test strategy"; PerformanceAgent asks "what hot-path concerns").
-- [ ] `agents/delivery.py` (new) — DeliveryAgent focuses on release risk (rollback, schema migration safety, backward compatibility, feature flags). `review_requirement` only at first — no `review()` counterpart yet.
-- [ ] `orchestrator/planner.py` — new function `plan_with_experts(requirement, repo_profile)`. Picks 2–4 experts via `agent_selector_for_plan` (or a per-build LLM call mirroring P1's `select_agents`). Runs them concurrently via `asyncio.gather` + the already-validated RLock pattern. Each expert pulls its own planning_memory (top-K) for its prompt.
+**Chunk B — Multi-expert plan phase (~0.5 day) — DONE 2026-05-14**
+- [x] `agents/base.py` — `review_requirement(requirement, repo_profile, memory)` method + `parse_requirement_response` + `_requirement_output_schema` + `_compact_profile` helper. Default `build_requirement_prompt` raises `NotImplementedError` so non-expert agents (e.g. BugFindingAgent) are filtered out by the selector.
+- [x] `agents/security.py`, `uiux.py`, `testing.py`, `performance.py` — each implements `build_requirement_prompt` with a sharp angle-specific prompt. Each ends with the shared `_requirement_output_schema()` so output shape is uniform.
+- [x] `agents/delivery.py` (new) — DeliveryAgent. `review()` deliberately raises (plan-phase only); the review-side contract verifier in Chunk D will check Delivery-owned criteria the same way as any other agent's.
+- [x] `orchestrator/agent_selector.py` — `select_experts_for_plan(requirement, repo_profile)` rule-based: always Security+Testing+Delivery; UIUX if frontend keywords; Performance if backend or perf keywords. Returns 3–5 experts depending on requirement scope.
+- [x] `orchestrator/planner.py` — `plan_with_experts(requirement, repo_profile)` fires all selected experts via `asyncio.gather` (`return_exceptions=True` so one failure doesn't sink the batch). P3 wrapper enforces the global concurrency cap. Each criterion is tagged with its `owner_agent` by the orchestrator (separation of concerns from the agent's perspective).
+- [x] Verified end-to-end on petclinic with `"add a notes field to Pet entity, both backend and frontend"`: 5 experts ran in 35.3s wallclock, 0 errors, 29 total criteria with all 5 distinct owners present, each expert showed clear angle ownership (Security→XSS, Testing→round-trip, UIUX→a11y, Delivery→rollback, Performance→payload size). LLM usage: 5 req · 3,845 in / 6,666 out.
 
 **Chunk C — Synthesizer + Architect Report UX (~0.5 day)**
 - [ ] `orchestrator/planner.py` — `synthesize_report(expert_outputs, requirement, repo_profile) -> ReportPayload` bundles clarify Qs + ranked suggestions + draft contract. Synthesizer is a single LLM call that takes all expert outputs as structured JSON input.
@@ -442,9 +444,9 @@ The agentic orchestration layer (`agent_selector`, `planner`, `runner`, `build_c
 ### 8.3 Test cases for verification
 
 **Multi-expert plan correctness**
-- [ ] `build "add a notes field to Pet entity"` produces a Contract with criteria from ≥ 2 distinct `owner_agent` values — *(chunks B+C)*
-- [ ] Every criterion has `priority` ∈ {must_have, should_have, nice_to_have}, non-empty `assertion`, non-empty `owner_agent` — *(chunks B+C; structurally enforced by Criterion schema today)*
-- [ ] The TaskGraph DAG and Contract are saved together on approve (one `task_graphs` row, `contract_json` populated) — *(chunks B+C)*
+- [x] `plan_with_experts("add a notes field to Pet entity, both backend and frontend")` produces proposed_criteria from 5 distinct `owner_agent` values — verified 2026-05-14.
+- [x] Every proposed criterion has `priority` ∈ {must_have, should_have, nice_to_have}, non-empty `assertion`, non-empty `owner_agent` — enforced by `parse_requirement_response` (Chunk B) + Criterion schema (Chunk A).
+- [ ] The TaskGraph DAG and Contract are saved together on approve (one `task_graphs` row, `contract_json` populated) — *(chunk C — synthesizer turns expert outputs into the final plan + persistable contract)*
 - [x] Re-loading the graph reconstructs the Contract with all criteria intact — verified 2026-05-14 at the model+DB layer (Chunk A smoke test).
 
 **Architect Report UX**

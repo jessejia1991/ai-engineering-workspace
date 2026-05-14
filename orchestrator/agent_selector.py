@@ -144,7 +144,7 @@ Return ONLY a JSON object in this exact format:
         )
 
     except Exception as e:
-        # 실패 시 기본값: 안전하게 모든 관련 agent 실행
+        # Fallback: rule-based safe defaults if LLM selection fails
         selected = ["SecurityAgent", "BugFindingAgent", "TestingAgent"]
         if hints["has_frontend"]:
             selected.append("UIUXAgent")
@@ -156,3 +156,77 @@ Return ONLY a JSON object in this exact format:
             skipped={},
             reasoning={"fallback": f"Agent selector failed ({e}), using rule-based defaults"},
         )
+
+
+# ===================================================================
+# P4 Chunk B — Expert selection for plan phase
+# ===================================================================
+# The plan-phase expert pool is different from the review-phase agent
+# pool: BugFindingAgent doesn't have a plan-phase angle (it works on
+# code that exists), and DeliveryAgent is plan-phase only.
+#
+# Selection is rule-based — there is no diff to look at, and an extra
+# LLM call to pick among 5 experts is more cost than signal. The rules
+# always include Security + Testing + Delivery (every change has those
+# angles), and conditionally include UIUX (frontend mentioned) and
+# Performance (backend / data / scale mentioned).
+
+PLAN_EXPERTS_ALWAYS = ["SecurityAgent", "TestingAgent", "DeliveryAgent"]
+
+_BACKEND_KEYWORDS = [
+    "entity", "api", "endpoint", "database", "schema", "migration",
+    "controller", "dto", "service", "repository", "mapper", "column",
+    "backend", "java", "spring",
+]
+_FRONTEND_KEYWORDS = [
+    "form", "input", "button", "component", "ui", "ux", "page", "screen",
+    "react", "typescript", "tsx", "frontend", "client", "client-side",
+    "css", "responsive", "accessibility", "a11y",
+]
+_PERF_KEYWORDS = [
+    "performance", "fast", "slow", "scale", "scalability", "load",
+    "concurrent", "throughput", "latency", "hot path", "query", "cache",
+    "pagination", "n+1",
+]
+
+
+def select_experts_for_plan(requirement: str, repo_profile: dict) -> AgentSelection:
+    """
+    Rule-based selection of plan-phase experts. Returns the same
+    AgentSelection shape as select_agents so callers can treat them
+    uniformly when logging / observing.
+    """
+    req = (requirement or "").lower()
+
+    selected = list(PLAN_EXPERTS_ALWAYS)
+    skipped: dict[str, str] = {}
+    reasoning: dict[str, str] = {
+        a: "always included in plan phase (every change has this angle)"
+        for a in PLAN_EXPERTS_ALWAYS
+    }
+
+    has_frontend = any(w in req for w in _FRONTEND_KEYWORDS) or "full stack" in req or "full-stack" in req
+    has_backend  = any(w in req for w in _BACKEND_KEYWORDS) or "full stack" in req or "full-stack" in req
+    has_perf     = any(w in req for w in _PERF_KEYWORDS)
+
+    if has_frontend:
+        selected.append("UIUXAgent")
+        reasoning["UIUXAgent"] = "frontend-related vocabulary detected in requirement"
+    else:
+        skipped["UIUXAgent"] = "no frontend vocabulary in requirement"
+
+    if has_backend or has_perf:
+        selected.append("PerformanceAgent")
+        reasoning["PerformanceAgent"] = (
+            "backend / data path detected — assess query patterns and payload size"
+            if has_backend
+            else "explicit performance keywords in requirement"
+        )
+    else:
+        skipped["PerformanceAgent"] = "no backend or perf vocabulary in requirement"
+
+    return AgentSelection(
+        selected=selected,
+        skipped=skipped,
+        reasoning=reasoning,
+    )

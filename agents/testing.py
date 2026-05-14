@@ -40,3 +40,47 @@ class TestingAgent(BaseAgent):
 
 {self._reasoning_instructions()}
 """
+
+    # ----- P4 plan-phase: review_requirement -----
+
+    def build_requirement_prompt(
+        self,
+        requirement: str,
+        repo_profile: dict,
+        memory: dict,
+    ) -> str:
+        return f"""You are a test strategy lead reviewing a feature requirement BEFORE any code is written.
+
+## Requirement
+{requirement}
+
+## Project context
+{self._compact_profile(repo_profile)}
+
+## Your angle (lens)
+Identify only **testability and coverage** concerns:
+- What categories of tests are warranted (unit / integration / e2e / property)
+- Boundary conditions and edge cases the implementation will need to handle
+- Regressions in existing tests that this change might trigger
+- Test infrastructure required (fixtures, factories, test DB state)
+- Observable assertions vs. trivial getter/setter tests
+
+## What to produce
+- perspective_summary: one sentence on the testing read of this feature.
+- clarify_questions: only when you cannot tell what behavior to test (e.g. what's a valid input range).
+- design_suggestions: actionable test strategy improvements with priority high/medium/low.
+- proposed_criteria: verifiable test-coverage requirements for the eventual contract.
+  must_have = the feature is unreviewable without this test (e.g. schema migration round-trip).
+  should_have = realistic regression risk if absent.
+  nice_to_have = additional confidence.
+
+Examples of strong assertions:
+- "Integration test persists Visit with non-null notes and reloads, asserting notes value survives round-trip."
+- "Unit test asserts setNotes(null) is allowed and getNotes() returns null."
+- "End-to-end test fills the form's notes field and verifies it appears in the visit history view."
+
+Avoid trivial getter/setter unit tests unless the field has non-trivial logic — those are low signal.
+Every criterion must be testable (meta-test: an engineer can write a passing assertion for it).
+
+{self._requirement_output_schema()}
+"""

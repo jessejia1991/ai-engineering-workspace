@@ -282,3 +282,87 @@ async def plan(
         ],
     }
     return result
+
+
+# ===================================================================
+# P4 Chunk B — Multi-expert plan-phase orchestration
+# ===================================================================
+# `plan_with_experts` runs 2-5 expert agents concurrently against the
+# requirement. Each expert returns its own angle (perspective_summary,
+# clarify_questions, design_suggestions, proposed_criteria). The
+# returned dict is the *raw* expert pool — Chunk C's Synthesizer turns
+# it into an Architect Report + final plan + Contract.
+#
+# Concurrency is bounded by the RateLimitedAnthropicClient semaphore
+# (P3, default max_concurrent=5), so a 5-way fan-out fits in one
+# window without rate-limit cascades.
+
+import asyncio
+
+
+async def plan_with_experts(
+    requirement: str,
+    repo_profile: dict,
+) -> dict:
+    """
+    Run all relevant plan-phase experts concurrently against the
+    requirement. Returns a dict with per-expert outputs plus the
+    selection metadata. Synthesis to a final plan + contract is the
+    next layer's job.
+
+    Returns:
+        {
+          "requirement":      str,
+          "selection":        AgentSelection,
+          "expert_outputs":   {agent_name: review_requirement_result, ...},
+          "errors":           {agent_name: error_str, ...},   # subset
+        }
+    """
+    from orchestrator.agent_selector import select_experts_for_plan
+    from orchestrator.runner import AGENT_REGISTRY
+    # DeliveryAgent lives outside the existing review-side AGENT_REGISTRY
+    # because it has no review() implementation. Pull it in directly.
+    from agents.delivery import DeliveryAgent
+
+    selection = select_experts_for_plan(requirement, repo_profile)
+
+    # Build the expert pool: review-side agents from registry + delivery
+    plan_registry = dict(AGENT_REGISTRY)
+    plan_registry["DeliveryAgent"] = DeliveryAgent()
+
+    experts = [
+        plan_registry[name]
+        for name in selection.selected
+        if name in plan_registry
+    ]
+
+    # Fire all experts concurrently. RateLimitedAnthropicClient (P3)
+    # already enforces a global concurrency cap, so we don't need to
+    # add our own semaphore here.
+    coros = [
+        e.review_requirement(requirement, repo_profile, memory={})
+        for e in experts
+    ]
+    results = await asyncio.gather(*coros, return_exceptions=True)
+
+    expert_outputs: dict[str, dict] = {}
+    errors:         dict[str, str]  = {}
+    for agent, result in zip(experts, results):
+        if isinstance(result, Exception):
+            errors[agent.name] = str(result)
+            continue
+        # Tag owner_agent onto each proposed_criterion so downstream
+        # code doesn't need to thread the agent name separately.
+        for c in result.get("proposed_criteria", []) or []:
+            c["owner_agent"] = agent.name
+        # Also tag design_suggestions for display attribution.
+        for s in result.get("design_suggestions", []) or []:
+            s["owner_agent"] = agent.name
+        expert_outputs[agent.name] = result
+
+    return {
+        "requirement":    requirement,
+        "selection":      selection,
+        "expert_outputs": expert_outputs,
+        "errors":         errors,
+    }
