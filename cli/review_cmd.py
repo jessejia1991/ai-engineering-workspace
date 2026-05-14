@@ -1,6 +1,7 @@
 import asyncio
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
 from rich import box
 
 from agents.llm_client import client as llm_client, format_usage_summary
@@ -13,6 +14,73 @@ SEVERITY_COLORS = {
     "medium":   "yellow",
     "low":      "dim white",
 }
+
+# P4: contract status rendering
+STATUS_ICON = {
+    "PASS":         "[green]✓[/green]",
+    "FAIL":         "[red]✗[/red]",
+    "UNVERIFIED":   "[yellow]?[/yellow]",
+}
+PRIORITY_COLOR = {
+    "must_have":    "red",
+    "should_have":  "yellow",
+    "nice_to_have": "dim white",
+}
+
+
+def _render_contract_status(summary: dict) -> None:
+    criteria = summary.get("criteria", [])
+    if not criteria:
+        return
+
+    by_status = {"PASS": 0, "FAIL": 0, "UNVERIFIED": 0}
+    for c in criteria:
+        by_status[c.get("status", "UNVERIFIED")] = by_status.get(c.get("status", "UNVERIFIED"), 0) + 1
+
+    must_fail_count = sum(
+        1 for c in criteria
+        if c.get("priority") == "must_have" and c.get("status") == "FAIL"
+    )
+
+    title = (
+        f"Contract Status  "
+        f"[dim](graph: {summary.get('graph_id', 'unknown')}, "
+        f"{by_status['PASS']} pass · "
+        f"{by_status['FAIL']} fail · "
+        f"{by_status['UNVERIFIED']} unverified)[/dim]"
+    )
+
+    table = Table(box=box.SIMPLE_HEAVY, show_header=True)
+    table.add_column("ID",       style="bold")
+    table.add_column("Priority", style="white")
+    table.add_column("Owner",    style="cyan")
+    table.add_column("Status",   style="white", justify="center")
+    table.add_column("Assertion / Evidence", style="white", overflow="fold")
+
+    for c in criteria:
+        pc    = PRIORITY_COLOR.get(c.get("priority", ""), "white")
+        icon  = STATUS_ICON.get(c.get("status", "UNVERIFIED"), "?")
+        owner = c.get("owner_agent", "")[:4]
+        body  = c.get("assertion", "")
+        ev    = c.get("evidence", "")
+        if ev:
+            body = body + f"\n[dim]→ {ev}[/dim]"
+        table.add_row(
+            c.get("criterion_id", ""),
+            f"[{pc}]{c.get('priority', '')}[/{pc}]",
+            owner,
+            icon,
+            body,
+        )
+
+    console.print()
+    console.print(Panel(table, title=title, border_style="magenta"))
+
+    if must_fail_count:
+        console.print(
+            f"[bold red]⚠ {must_fail_count} must_have criterion FAILED — "
+            f"merge_recommendation downgraded to request_changes.[/bold red]"
+        )
 
 
 def _render_agent_reasoning(reasoning_by_agent: dict, agents_run: list):
@@ -74,9 +142,11 @@ def _render_agent_reasoning(reasoning_by_agent: dict, agents_run: list):
         console.print()
 
 
-async def cmd_review(pr_number: int, branch: str = None):
+async def cmd_review(pr_number: int, branch: str = None, *,
+                     graph_id: str = None, no_graph: bool = False):
     try:
-        await _cmd_review_inner(pr_number, branch)
+        await _cmd_review_inner(pr_number, branch,
+                                graph_id=graph_id, no_graph=no_graph)
     finally:
         # P3: LLM usage observability — print on every exit path
         # (success, RuntimeError, unexpected exception). Reset for next.
@@ -86,9 +156,10 @@ async def cmd_review(pr_number: int, branch: str = None):
         llm_client.reset_usage()
 
 
-async def _cmd_review_inner(pr_number: int, branch: str = None):
+async def _cmd_review_inner(pr_number: int, branch: str = None, *,
+                            graph_id: str = None, no_graph: bool = False):
     from orchestrator.runner import run_review
-    from github_client import post_review_comments
+    from github_client import post_review_comments, get_pr_description
     from database import get_agent_reasoning
 
     console.print()
@@ -101,10 +172,24 @@ async def _cmd_review_inner(pr_number: int, branch: str = None):
     def on_status(msg):
         console.print(f"  [dim]{msg}[/dim]")
 
+    # P4: pull PR description for auto-match (skip if --no-graph or
+    # explicit --graph already provided).
+    pr_description = ""
+    auto_match = not no_graph and graph_id is None
+    if auto_match:
+        on_status("Fetching PR description for auto-match...")
+        pr_description = get_pr_description(pr_number)
+        if not pr_description:
+            on_status("PR description unavailable; auto-match disabled")
+            auto_match = False
+
     try:
         findings, risk_report = await run_review(
             pr_number=pr_number,
             branch=branch,
+            graph_id=graph_id,
+            pr_description=pr_description,
+            auto_match=auto_match,
             on_status=on_status,
         )
     except RuntimeError as e:
@@ -176,6 +261,10 @@ async def _cmd_review_inner(pr_number: int, branch: str = None):
         console.print("\n[bold]Top Actions:[/bold]")
         for action in risk_report.top_actions:
             console.print(f"  [cyan]→[/cyan] {action}")
+
+    # P4: Contract Status panel — rendered only when a contract is in scope
+    if risk_report.contract_summary:
+        _render_contract_status(risk_report.contract_summary)
 
     # Post to GitHub
     console.print()

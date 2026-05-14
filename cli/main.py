@@ -62,6 +62,8 @@ def _interactive_shell():
         elif cmd == "review":
             pr_number = None
             branch = None
+            graph_id = None
+            no_graph = False
             i = 0
             while i < len(args):
                 if args[i] == "--pr" and i+1 < len(args):
@@ -70,12 +72,18 @@ def _interactive_shell():
                 elif args[i] == "--branch" and i+1 < len(args):
                     branch = args[i+1]
                     i += 2
+                elif args[i] == "--graph" and i+1 < len(args):
+                    graph_id = args[i+1]
+                    i += 2
+                elif args[i] == "--no-graph":
+                    no_graph = True
+                    i += 1
                 else:
                     i += 1
             if pr_number is None:
-                console.print("[red]Usage: review --pr <number> [--branch <name>][/red]")
+                console.print("[red]Usage: review --pr <number> [--branch <name>] [--graph GRAPH-xyz | --no-graph][/red]")
             else:
-                asyncio.run(_cmd_review(pr_number, branch))
+                asyncio.run(_cmd_review(pr_number, branch, graph_id, no_graph))
         elif cmd == "reflect":
             task_id = args[0] if args else None
             asyncio.run(_cmd_reflect(task_id))
@@ -185,9 +193,10 @@ async def _cmd_status():
     console.print(table)
 
 
-async def _cmd_review(pr_number: int, branch: str = None):
+async def _cmd_review(pr_number: int, branch: str = None,
+                      graph_id: str = None, no_graph: bool = False):
     from cli.review_cmd import cmd_review
-    await cmd_review(pr_number, branch)
+    await cmd_review(pr_number, branch, graph_id=graph_id, no_graph=no_graph)
 
 
 async def _cmd_reflect(task_id: str = None):

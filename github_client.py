@@ -25,6 +25,22 @@ def get_repo():
     return g.get_repo(GITHUB_REPO)
 
 
+def get_pr_description(pr_number: int) -> str:
+    """
+    Return PR title + body. Used by P4 auto-match to semantically locate
+    the corresponding plan_graph in planning_memory. Returns empty string
+    on any failure — caller falls back to generic review.
+    """
+    try:
+        repo = get_repo()
+        pr = repo.get_pull(pr_number)
+        title = pr.title or ""
+        body  = pr.body or ""
+        return f"{title}\n\n{body}".strip()
+    except (GithubException, RuntimeError):
+        return ""
+
+
 def post_review_comments(
     pr_number: int,
     findings: list[AgentFinding],

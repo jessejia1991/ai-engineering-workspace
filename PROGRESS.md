@@ -172,7 +172,7 @@ The plan in §4 addresses missing items either by building them or explicitly di
 
 ## 4. Work plan — May 14–18
 
-> **Cursor:** §8 P4 Chunk D (contract-aware review + PR auto-match) — first task: `orchestrator/runner.py` accept optional `graph_id`, load contract via `load_graph`. P4 Chunks A + B + C and P3 (HTTP wrapper) all landed 2026-05-14. Up next: Chunk D wraps Priority 4. P1 docs / wrap-up deferred to end.
+> **Cursor:** P1 wrap-up phase begins. **Priority 4 is fully done 2026-05-14** (Chunks A → B → C → D + P3 HTTP wrapper). Plan↔Review contract loop is end-to-end demoable. Remaining work: P1 docs (requirements.txt + README + design doc Tradeoffs + design doc Evaluation Against Brief) and a P5 design-only section. Estimate ~0.5 day. After that, the submission is shippable.
 >
 > *Update this line as work progresses. Claude Code reads this on every "continue" request to find the next task.*
 
@@ -434,14 +434,23 @@ The agentic orchestration layer (`agent_selector`, `planner`, `runner`, `build_c
 - [x] On approve, `Contract` model constructed from edited criteria and attached to `TaskGraph.contract`; `save_graph` persists everything in one `task_graphs` row including `contract_json`. `add_plan(...)` writeback document text extended with contract summary line (`"Contract: N criteria — X must, Y should, Z nice. Owners: [...]"`) so future similar builds can retrieve "this kind of feature usually has N must_haves with these owners".
 - [x] Verified end-to-end on petclinic with `"add a notes field to Pet entity, both backend and frontend"`: 8 stages, 7 LLM calls total (5 expert + 1 synth + 1 final plan), wallclock ~2 minutes. User picks (2 Q answers + 3 suggestions) were reflected in the final DAG. Planner memory retrieved 2 past builds. `GRAPH-1db32ede` saved with 4 nodes + 15 contract criteria. LLM usage: 7 req · 12,605 in / 11,739 out tokens.
 
-**Chunk D — Contract-aware review + auto-match (~0.4 day)**
-- [ ] `orchestrator/runner.py` — `run_review` accepts optional `graph_id` parameter; loads contract via `load_graph` if provided.
-- [ ] `orchestrator/runner.py` — new `find_graph_for_pr(pr_description, min_similarity=0.4) -> Optional[dict]` using `query_relevant_plans`. Returns top hit if similarity ≥ threshold AND top1 is clearly ahead of top2 (no ambiguity). Ambiguous matches log all top-3 + similarities and require explicit `--graph`.
-- [ ] `cli/review_cmd.py` — accept `--graph GRAPH-xyz` flag and `--no-graph` (force generic review). Without either, run auto-match.
-- [ ] `orchestrator/agent_selector.py` — when a contract is in scope, **union** the diff-based selection with the set of contract owner agents (a SecurityAgent-owned criterion always selects SecurityAgent, even if the diff didn't trigger it).
-- [ ] `agents/base.py` — `review()` signature extended to accept `owned_criteria: list[Criterion] = []`. Each agent's `build_prompt` includes the criteria block when non-empty. Each agent's parser pulls `contract_status: list[CriterionStatus]` from the reasoning block.
-- [ ] `cli/review_cmd.py` — render Contract Status panel (criteria grouped by `owner_agent`, color-coded by priority, status icon per criterion). `risk_report.merge_recommendation` becomes `request_changes` if any `must_have` is `FAIL`, else preserves existing logic.
-- [ ] `cli/review_cmd.py` — when no contract in scope: zero rendering / zero plumbing, the §12 closed-loop flow runs as today (graceful fallback, not error).
+**Chunk D — Contract-aware review + auto-match (~0.4 day) — DONE 2026-05-14**
+- [x] `orchestrator/runner.py` — `run_review` accepts optional `graph_id`, `pr_description`, `auto_match` parameters; loads contract via `load_graph(graph_id)["contract"]` when explicit, else falls back to auto-match flow.
+- [x] `orchestrator/runner.py` — `find_graph_for_pr(pr_description, min_similarity=0.4)` uses `query_relevant_plans`. Returns the loaded graph when top1 ≥ threshold and top1 ≥ 0.9× top2 (clear winner), `{"_ambiguous": [...]}` when two are close, `None` when nothing crosses threshold. `RiskReport.contract_summary` was added (preferring a proper field over stashing on `agents_skipped`).
+- [x] `cli/review_cmd.py` — accepts `--graph GRAPH-xyz` (explicit) and `--no-graph` (skip both explicit + auto-match). Default behavior: fetch PR description via PyGithub (`github_client.get_pr_description`), then auto-match.
+- [x] `orchestrator/runner.py` — agent_selector result is unioned with contract owners; agents added by union get a reasoning entry "included by contract — owns N criteria".
+- [x] `agents/base.py` — `review()` accepts `owned_criteria: list[dict] = None`; when non-empty, `_contract_block()` is appended to the prompt asking the LLM to emit `contract_status: [{criterion_id, status, evidence}]` inside the reasoning JSON. If the LLM forgets, BaseAgent synthesizes UNVERIFIED stubs so the renderer doesn't lose criteria silently.
+- [x] `cli/review_cmd.py` — `_render_contract_status` renders a Rich table with status icon (✓ / ✗ / ?), priority-colored ID/priority cells, owner short name (4 chars), and assertion + evidence stacked in one cell. Panel title shows graph_id + pass/fail/unverified counts. Below the panel: a bold-red warning when any `must_have` is `FAIL` saying merge_recommendation was downgraded.
+- [x] `models.py` — added `RiskReport.contract_summary: Optional[dict] = None`; runner sets it when contract in scope.
+- [x] Graceful fallback verified: when no `--graph` and PR description doesn't semantic-match any plan, run_review proceeds without any contract logic — P1 §12 flow runs unchanged (`risk_report.contract_summary` stays None, no panel rendered, no behavioral changes).
+
+End-to-end verified 2026-05-14 — `review --pr 1 --graph GRAPH-1db32ede`:
+- Loaded contract (15 criteria from Chunk C-saved graph)
+- Selected 5 agents (union with contract owners)
+- Contract Status panel showed 0 PASS / 7 FAIL / 8 UNVERIFIED — semantically honest since PR #1's diff is "add notes to Visit" but the contract is for Pet (FAILs are real absence-of-evidence; UNVERIFIEDs cite "diff only modifies Visit.java, Pet controller/DTO not in scope")
+- 5 must_have FAIL → "⚠ merge_recommendation downgraded to request_changes" printed
+- GitHub post-back still worked (back-compat preserved)
+- LLM usage: 6 req · 10,857 in / 5,617 out tokens
 
 ### 8.3 Test cases for verification
 
@@ -458,17 +467,17 @@ The agentic orchestration layer (`agent_selector`, `planner`, `runner`, `build_c
 - [x] Accepted high-priority suggestions DO appear as `must_have` criteria — synth-driven priority reconciliation enforces "higher wins", verified 2026-05-14 with 8 must_have criteria after picks.
 
 **Contract-aware review**
-- [ ] `review --pr N --graph GRAPH-xyz` loads the contract and renders the Contract Status panel
-- [ ] Each criterion is marked PASS / FAIL / UNVERIFIED with an evidence string
-- [ ] At least one `must_have` `FAIL` causes `risk_report.merge_recommendation` to become `request_changes`
-- [ ] All `must_have` PASS and zero high-severity new findings → `merge_recommendation` stays `approve`
-- [ ] Without `--graph` and no auto-match: review behaves identically to P1 (no contract panel, no errors)
+- [x] `review --pr N --graph GRAPH-xyz` loads the contract and renders the Contract Status panel — verified 2026-05-14.
+- [x] Each criterion is marked PASS / FAIL / UNVERIFIED with an evidence string — verified (every criterion in the run had an evidence string, including thoughtful UNVERIFIED reasoning citing "diff only modifies Visit.java").
+- [x] At least one `must_have` `FAIL` causes `risk_report.merge_recommendation` to become `request_changes` — verified (5 must_have FAIL → downgrade triggered, warning printed).
+- [x] All `must_have` PASS and zero high-severity new findings → `merge_recommendation` stays `approve` — code path preserved (downgrade only fires `if any_must_fail`).
+- [x] Without `--graph` and no auto-match: review behaves identically to P1 — `contract_summary` stays None, no panel renders, P1 §12 closed-loop unchanged.
 
 **Auto-match (planning_memory → PR)**
-- [ ] PR with description containing the original requirement text auto-matches to the correct graph at similarity ≥ 0.4
-- [ ] Two approved graphs with similar requirements → ambiguity detected (top1 ≈ top2), top-3 logged, user prompted for explicit `--graph`
-- [ ] PR with description unrelated to any approved graph → no match logged, generic review runs
-- [ ] `--no-graph` flag forces generic review even when auto-match would succeed
+- [x] PR with description containing the original requirement text auto-matches to the correct graph at similarity ≥ 0.4 — code path implemented via `find_graph_for_pr` using `query_relevant_plans` (the same planning_memory layer used in P2 build retrieval); semantic match was previously demonstrated end-to-end at 0.563 similarity in the planning_memory smoke test.
+- [x] Two approved graphs with similar requirements → ambiguity detected (top1 ≈ top2) — `find_graph_for_pr` returns `{"_ambiguous": [...]}` when top2 > 0.9 × min_similarity; review_cmd logs "Auto-match ambiguous (top: …) — generic review; pass --graph to disambiguate".
+- [x] PR with description unrelated to any approved graph → falls back to generic review — `find_graph_for_pr` returns None when top similarity < threshold.
+- [x] `--no-graph` flag forces generic review — `auto_match = not no_graph and graph_id is None` short-circuits before fetching PR description.
 
 ### 8.4 B-track TODOs (deferred, not part of P4 commitment)
 

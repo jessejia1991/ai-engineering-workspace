@@ -21,13 +21,18 @@ class BaseAgent(ABC):
         diff: str,
         file_contents: dict,
         repo_profile: dict,
-        memory: dict,           # ChromaDB retrieval results
+        memory: dict,                                 # ChromaDB retrieval results
+        owned_criteria: list[dict] | None = None,     # P4: criteria this agent must verify
     ) -> tuple[list[AgentFinding], dict]:
         """
         Returns (findings, reasoning).
-        reasoning contains: codebase_understanding, rejected_candidates, confidence.
+        reasoning contains: codebase_understanding, rejected_candidates,
+        confidence, and (when owned_criteria is non-empty) contract_status.
         """
+        owned_criteria = owned_criteria or []
         prompt = self.build_prompt(task, diff, file_contents, repo_profile, memory)
+        if owned_criteria:
+            prompt = prompt + "\n\n" + self._contract_block(owned_criteria)
 
         try:
             response = await client.messages.create(
@@ -41,6 +46,18 @@ class BaseAgent(ABC):
             reasoning = reasoning or {}
             reasoning["_raw_response"] = raw[:8000]
             reasoning["_stop_reason"] = stop_reason
+            # If the agent owned criteria but the response didn't include
+            # contract_status, synthesize UNVERIFIED stubs so the
+            # renderer doesn't lose criteria silently.
+            if owned_criteria and not reasoning.get("contract_status"):
+                reasoning["contract_status"] = [
+                    {
+                        "criterion_id": c.get("id", ""),
+                        "status":       "UNVERIFIED",
+                        "evidence":     "agent did not emit contract_status for this criterion",
+                    }
+                    for c in owned_criteria
+                ]
             return findings, reasoning
 
         except Exception as e:
@@ -152,6 +169,56 @@ class BaseAgent(ABC):
             f"frontend={len(files.get('frontend', []))}, "
             f"test={len(files.get('test', []))}"
         )
+
+    def _contract_block(self, owned_criteria: list[dict]) -> str:
+        """
+        Append-block injected into the review prompt when the agent
+        owns contract criteria (P4 Chunk D). Tells the LLM about its
+        owned criteria and asks for a contract_status entry per criterion
+        inside the reasoning JSON.
+        """
+        if not owned_criteria:
+            return ""
+        lines = []
+        for c in owned_criteria:
+            lines.append(
+                f"  {c.get('id', '?')} [{c.get('priority', '?')}] "
+                f"[{c.get('category', '')}] {c.get('assertion', '')}"
+            )
+        crit_text = "\n".join(lines)
+        return f"""
+## Contract criteria you own (P4)
+
+You are the agent responsible for verifying these criteria against the diff
+and surrounding code. Each one was agreed in the plan phase — do not
+re-litigate whether the criterion is reasonable; only assess whether the
+implementation in this PR satisfies it.
+
+{crit_text}
+
+For each criterion above, ADD an entry to your reasoning JSON under a new
+`contract_status` array — same level as `rejected_candidates`:
+
+  "contract_status": [
+    {{
+      "criterion_id": "c1",
+      "status": "PASS | FAIL | UNVERIFIED",
+      "evidence": "Short pointer to what you looked at: file:line, snippet, or '\
+why you could not verify in this diff'"
+    }}
+  ]
+
+Status rules:
+- PASS: you found concrete evidence in the diff or unchanged code that the
+  assertion holds. Cite the file/line/method in evidence.
+- FAIL: you found evidence the assertion is violated. Cite where.
+- UNVERIFIED: the diff doesn't cover this aspect (e.g. a backend authz
+  criterion when the diff is frontend-only). Explain why in evidence.
+
+Findings you already report can additionally cite a criterion by setting
+`finding.criterion_id`, but this is optional. The primary surface is the
+`contract_status` array.
+"""
 
     def _reasoning_instructions(self) -> str:
         """Standard reasoning format instructions appended to every agent prompt."""

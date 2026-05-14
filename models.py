@@ -40,6 +40,7 @@ class RiskReport(BaseModel):
     by_agent: dict = {}          # agent_name -> {risk, count}
     top_actions: list[str] = []
     merge_recommendation: str    # approve | request_changes | reject
+    contract_summary: Optional[dict] = None  # P4: {graph_id, criteria[], any_must_fail}
 
 
 class AgentSelection(BaseModel):
