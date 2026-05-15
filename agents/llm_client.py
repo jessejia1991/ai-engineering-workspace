@@ -59,8 +59,9 @@ def _env_opt_int(name: str) -> Optional[int]:
 
 DEFAULT_MAX_CONCURRENT     = _env_int("ANTHROPIC_MAX_CONCURRENT", 5)
 DEFAULT_REQUEST_TIMEOUT_S  = _env_float("ANTHROPIC_REQUEST_TIMEOUT_S", 120.0)
-DEFAULT_MAX_RETRIES        = _env_int("ANTHROPIC_MAX_RETRIES", 4)
-DEFAULT_BACKOFF_BASE_S     = _env_float("ANTHROPIC_BACKOFF_BASE_S", 1.0)
+DEFAULT_MAX_RETRIES        = _env_int("ANTHROPIC_MAX_RETRIES", 6)        # bumped from 4 after PR #4533 hit rate limit at 4
+DEFAULT_BACKOFF_BASE_S     = _env_float("ANTHROPIC_BACKOFF_BASE_S", 2.0) # bumped from 1.0 — anthropic 429 reset is typically 60s, not 15s
+DEFAULT_BACKOFF_MAX_S      = _env_float("ANTHROPIC_BACKOFF_MAX_S", 60.0) # cap so we don't sleep forever on exponential
 DEFAULT_TOKEN_BUDGET       = _env_opt_int("ANTHROPIC_TOKEN_BUDGET")
 
 
@@ -91,12 +92,14 @@ class RateLimitedAnthropicClient:
         request_timeout_s:  float = DEFAULT_REQUEST_TIMEOUT_S,
         max_retries:        int   = DEFAULT_MAX_RETRIES,
         backoff_base_s:     float = DEFAULT_BACKOFF_BASE_S,
+        backoff_max_s:      float = DEFAULT_BACKOFF_MAX_S,
         token_budget:       Optional[int] = DEFAULT_TOKEN_BUDGET,
     ):
         self.max_concurrent    = max_concurrent
         self.request_timeout_s = request_timeout_s
         self.max_retries       = max_retries
         self.backoff_base_s    = backoff_base_s
+        self.backoff_max_s     = backoff_max_s
         self.token_budget      = token_budget
 
         # Disable SDK-level retry so this wrapper has sole control over
@@ -176,11 +179,11 @@ class RateLimitedAnthropicClient:
                     self._n_timeouts += 1
                     raise
 
-                except anthropic.RateLimitError:
+                except anthropic.RateLimitError as e:
                     if attempt >= self.max_retries:
                         raise
                     self._n_retries += 1
-                    await asyncio.sleep(self.backoff_base_s * (2 ** attempt))
+                    await asyncio.sleep(self._backoff_for(attempt, e))
                     continue
 
                 except anthropic.APIStatusError as e:
@@ -190,9 +193,30 @@ class RateLimitedAnthropicClient:
                         if attempt >= self.max_retries:
                             raise
                         self._n_retries += 1
-                        await asyncio.sleep(self.backoff_base_s * (2 ** attempt))
+                        await asyncio.sleep(self._backoff_for(attempt, e))
                         continue
                     raise
+
+    def _backoff_for(self, attempt: int, error: Exception) -> float:
+        """
+        Compute sleep before retry. Prefers the server's Retry-After hint
+        when present (Anthropic includes one in some 429s); falls back to
+        exponential `base * 2**attempt`, capped at `backoff_max_s`.
+        """
+        # Look for a Retry-After hint on the response, if any.
+        # anthropic SDK exposes the underlying response on the error object.
+        retry_after = None
+        try:
+            resp = getattr(error, "response", None)
+            if resp is not None:
+                hdr = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
+                if hdr:
+                    retry_after = float(hdr)
+        except Exception:
+            pass
+        if retry_after is not None and retry_after > 0:
+            return min(retry_after, self.backoff_max_s)
+        return min(self.backoff_base_s * (2 ** attempt), self.backoff_max_s)
 
 
 class _MessagesProxy:

@@ -87,6 +87,29 @@ async def execute_agent_with_retry(
     return [], {}
 
 
+def _dedupe_findings(findings: list[AgentFinding]) -> list[AgentFinding]:
+    """
+    Collapse duplicate findings across groups. Same (agent, file, line)
+    is collapsed; tie-break keeps the entry with the longest detail
+    (most informative). For findings without file/line, fall back to
+    (agent, normalized_title) so general findings don't dedupe across
+    unrelated topics.
+    """
+    import re
+    by_key: dict[tuple, AgentFinding] = {}
+    for f in findings:
+        if f.file and f.line is not None:
+            key = (f.agent, f.file, f.line)
+        else:
+            # normalize title: strip + lowercase + collapse whitespace
+            t = re.sub(r"\s+", " ", (f.title or "").strip().lower())[:80]
+            key = (f.agent, "", t)
+        prev = by_key.get(key)
+        if prev is None or len(f.detail or "") > len(prev.detail or ""):
+            by_key[key] = f
+    return list(by_key.values())
+
+
 def aggregate_findings(
     all_findings: list[AgentFinding],
     selection,
@@ -130,6 +153,68 @@ def aggregate_findings(
         top_actions=top_actions,
         merge_recommendation=recommendation,
     )
+
+
+# ===================================================================
+# File grouping (P3-bis) — pack file_contents into bounded-size groups
+# to avoid swamping Anthropic ITPM on large PRs.
+# ===================================================================
+# Strategy: when changed_files exceed a threshold (either count or
+# total chars), pack files into groups whose total char count fits
+# under a budget. Each group runs the full agent fan-out serially.
+# Findings accumulate across groups.
+#
+# Trade-off: slower wallclock vs no rate-limit cascade. Discovered on
+# vaadin/hilla PR #4533 (26 files, 200K chars) — single-shot path
+# triggered RateLimitError on 2/4 agents under Sonnet 4.6's 50K ITPM.
+
+import os as _os
+
+MAX_FILES_PER_GROUP   = int(_os.environ.get("REVIEW_MAX_FILES_PER_GROUP", "10"))
+MAX_CHARS_PER_GROUP   = int(_os.environ.get("REVIEW_MAX_CHARS_PER_GROUP", "40000"))
+
+
+def _pack_files_into_groups(
+    file_contents: dict[str, str],
+    max_files: int = MAX_FILES_PER_GROUP,
+    max_chars: int = MAX_CHARS_PER_GROUP,
+) -> list[list[str]]:
+    """
+    Greedy bin-packing: sort files by char size descending, then for
+    each file place it into the first group with room, else open a
+    new group. Returns list of file-path lists (groups).
+    """
+    sized = sorted(
+        file_contents.items(),
+        key=lambda kv: len(kv[1] or ""),
+        reverse=True,
+    )
+
+    groups: list[dict] = []   # each: {"files": [...], "chars": int}
+
+    for path, content in sized:
+        size = len(content or "")
+        placed = False
+        for g in groups:
+            if (
+                len(g["files"]) < max_files
+                and g["chars"] + size <= max_chars
+            ):
+                g["files"].append(path)
+                g["chars"] += size
+                placed = True
+                break
+        if not placed:
+            groups.append({"files": [path], "chars": size})
+
+    return [g["files"] for g in groups]
+
+
+def _should_group(file_contents: dict[str, str]) -> bool:
+    if len(file_contents) > MAX_FILES_PER_GROUP:
+        return True
+    total = sum(len(c or "") for c in file_contents.values())
+    return total > MAX_CHARS_PER_GROUP
 
 
 async def find_graph_for_pr(
@@ -312,46 +397,88 @@ async def run_review(
         for agent in agents_to_run
     ]
 
-    status("Running agents in parallel...")
-
-    review_tasks = [
-        execute_agent_with_retry(
-            agent, task, diff, file_contents, repo_profile, memory,
-            owned_criteria=owned_by_agent.get(agent.name, []),
+    # Decide whether to group. Single shot is the common case (small PR);
+    # grouping kicks in for large PRs that would otherwise hit ITPM.
+    do_group = _should_group(file_contents)
+    if do_group:
+        groups = _pack_files_into_groups(file_contents)
+        status(
+            f"Grouping enabled: {len(file_contents)} files, "
+            f"{sum(len(c) for c in file_contents.values())} chars "
+            f"→ {len(groups)} group(s) (max {MAX_FILES_PER_GROUP} files / "
+            f"{MAX_CHARS_PER_GROUP} chars per group)"
         )
-        for agent, memory in zip(agents_to_run, memories)
-    ]
+    else:
+        groups = [list(file_contents.keys())]
 
-    results = await asyncio.gather(*review_tasks, return_exceptions=True)
-
-    # 8. Collect findings + contract statuses
     all_findings = []
-    contract_statuses: dict[str, dict] = {}  # criterion_id → {status, evidence, owner}
-    for agent, result in zip(agents_to_run, results):
-        if isinstance(result, Exception):
-            status(f"{agent.name} raised exception: {result}")
-            continue
-        findings, reasoning = result
-        for finding in findings:
-            all_findings.append(finding)
-            if finding.status == "ok":
-                await save_finding(
-                    task_id, finding.agent,
-                    finding.severity, finding.model_dump()
-                )
-        # P4: each agent that owned criteria emits contract_status entries
-        for cs in (reasoning.get("contract_status") or []):
-            if not isinstance(cs, dict):
+    contract_statuses: dict[str, dict] = {}     # criterion_id → best status seen
+    # Status priority for contract_status reconciliation across groups:
+    # if any group reports PASS we trust it; FAIL overrides UNVERIFIED.
+    STATUS_RANK = {"PASS": 3, "FAIL": 2, "UNVERIFIED": 1}
+
+    for g_idx, group_files in enumerate(groups, start=1):
+        group_contents = {f: file_contents[f] for f in group_files}
+        group_chars    = sum(len(c) for c in group_contents.values())
+        if do_group:
+            status(
+                f"Group {g_idx}/{len(groups)}: "
+                f"{len(group_files)} file(s), {group_chars} chars — "
+                f"running {len(agents_to_run)} agent(s) concurrently"
+            )
+        else:
+            status("Running agents in parallel...")
+
+        review_tasks = [
+            execute_agent_with_retry(
+                agent, task, diff, group_contents, repo_profile, memory,
+                owned_criteria=owned_by_agent.get(agent.name, []),
+            )
+            for agent, memory in zip(agents_to_run, memories)
+        ]
+        results = await asyncio.gather(*review_tasks, return_exceptions=True)
+
+        for agent, result in zip(agents_to_run, results):
+            if isinstance(result, Exception):
+                status(f"{agent.name} raised exception in group {g_idx}: {result}")
                 continue
-            cid = cs.get("criterion_id")
-            if not cid:
-                continue
-            contract_statuses[cid] = {
-                "criterion_id": cid,
-                "status":       cs.get("status", "UNVERIFIED"),
-                "evidence":     cs.get("evidence", ""),
-                "owner_agent":  agent.name,
-            }
+            findings, reasoning = result
+            # Defer save — we dedupe across groups before persisting.
+            all_findings.extend(findings)
+            # P4: contract_status reconciliation across groups — pick the
+            # most informative signal (PASS > FAIL > UNVERIFIED).
+            for cs in (reasoning.get("contract_status") or []):
+                if not isinstance(cs, dict):
+                    continue
+                cid = cs.get("criterion_id")
+                if not cid:
+                    continue
+                new_status = cs.get("status", "UNVERIFIED")
+                prev = contract_statuses.get(cid)
+                if prev is None or STATUS_RANK.get(new_status, 0) > STATUS_RANK.get(prev.get("status", "UNVERIFIED"), 0):
+                    contract_statuses[cid] = {
+                        "criterion_id": cid,
+                        "status":       new_status,
+                        "evidence":     cs.get("evidence", ""),
+                        "owner_agent":  agent.name,
+                    }
+
+    # Dedup across groups (P3-bis): same (agent, file, line) collapse
+    # to one finding, keeping the most informative copy. Saves
+    # downstream SQLite from duplicate rows and review_cmd from rendering
+    # repeated findings.
+    if do_group and len(groups) > 1:
+        pre = len(all_findings)
+        all_findings = _dedupe_findings(all_findings)
+        status(f"Deduped findings across groups: {pre} → {len(all_findings)}")
+
+    # Now save (post-dedupe). Skip findings with status != 'ok'.
+    for f in all_findings:
+        if f.status == "ok":
+            await save_finding(
+                task_id, f.agent,
+                f.severity, f.model_dump()
+            )
 
     # 9. Aggregate
     status("Aggregating findings...")

@@ -143,10 +143,12 @@ def _render_agent_reasoning(reasoning_by_agent: dict, agents_run: list):
 
 
 async def cmd_review(pr_number: int, branch: str = None, *,
-                     graph_id: str = None, no_graph: bool = False):
+                     graph_id: str = None, no_graph: bool = False,
+                     post_decision: bool | None = None):
     try:
         await _cmd_review_inner(pr_number, branch,
-                                graph_id=graph_id, no_graph=no_graph)
+                                graph_id=graph_id, no_graph=no_graph,
+                                post_decision=post_decision)
     finally:
         # P3: LLM usage observability — print on every exit path
         # (success, RuntimeError, unexpected exception). Reset for next.
@@ -157,7 +159,8 @@ async def cmd_review(pr_number: int, branch: str = None, *,
 
 
 async def _cmd_review_inner(pr_number: int, branch: str = None, *,
-                            graph_id: str = None, no_graph: bool = False):
+                            graph_id: str = None, no_graph: bool = False,
+                            post_decision: bool | None = None):
     from orchestrator.runner import run_review
     from github_client import post_review_comments, get_pr_description
     from database import get_agent_reasoning
@@ -266,18 +269,44 @@ async def _cmd_review_inner(pr_number: int, branch: str = None, *,
     if risk_report.contract_summary:
         _render_contract_status(risk_report.contract_summary)
 
-    # Post to GitHub
+    # Post to GitHub — two-gate safety:
+    #   Gate 1 (this caller): --post / REVIEW_POST_COMMENTS opt-in
+    #   Gate 2 (post_review_comments): REVIEW_ALLOWED_REPOS allowlist
+    # Both must pass. Posting to a real OSS repo without permission is
+    # the kind of bug you only need to make once — we made it once.
+    import os
+    from github_client import is_post_allowed_repo
+    repo = os.environ.get("GITHUB_REPO", "")
+    env_opt_in = os.environ.get("REVIEW_POST_COMMENTS", "").lower() in ("1", "true", "yes")
+    if post_decision is None:
+        do_post = env_opt_in
+    else:
+        do_post = post_decision
+
     console.print()
-    console.print("[dim]Posting findings to GitHub PR...[/dim]")
-    success = post_review_comments(pr_number, findings, risk_report)
-    if success:
+    if not do_post:
+        target = f"{repo}#{pr_number}" if repo else f"PR #{pr_number}"
         console.print(
-            f"[green]✓ Posted to GitHub PR #{pr_number}[/green]  "
-            f"[dim]https://github.com/"
-            f"jessejia1991/spring-petclinic-reactjs/pull/{pr_number}[/dim]"
+            f"[dim]Skipped GitHub comment post (target: {target}). "
+            f"Pass --post or set REVIEW_POST_COMMENTS=true to enable.[/dim]"
         )
     else:
-        console.print("[yellow]⚠ GitHub posting failed — check GITHUB_TOKEN[/yellow]")
+        allowed, reason = is_post_allowed_repo()
+        if not allowed:
+            console.print(
+                f"[yellow]⚠ GitHub post BLOCKED by allowlist:[/yellow] {reason}"
+            )
+        else:
+            console.print("[dim]Posting findings to GitHub PR...[/dim]")
+            success = post_review_comments(pr_number, findings, risk_report)
+            if success:
+                url = f"https://github.com/{repo}/pull/{pr_number}" if repo else ""
+                console.print(
+                    f"[green]✓ Posted to GitHub PR #{pr_number}[/green]  "
+                    + (f"[dim]{url}[/dim]" if url else "")
+                )
+            else:
+                console.print("[yellow]⚠ GitHub posting failed[/yellow]")
 
     console.print()
     console.print(

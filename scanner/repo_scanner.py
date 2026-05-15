@@ -132,11 +132,42 @@ def classify_files(all_files: list[str]) -> dict:
     return classification
 
 
+def _default_branch(repo_root: str) -> str:
+    """
+    Detect the default branch (modern repos use `main`, legacy use `master`).
+    Falls back to `master` if detection fails so existing petclinic flow keeps
+    working. Override with ANTHROPIC_DEFAULT_BRANCH env var if needed.
+    """
+    forced = os.environ.get("REVIEW_BASE_BRANCH")
+    if forced:
+        return forced
+    try:
+        result = subprocess.run(
+            ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+            cwd=repo_root, capture_output=True, text=True, timeout=5,
+        )
+        ref = result.stdout.strip()
+        if ref.startswith("refs/remotes/origin/"):
+            return ref[len("refs/remotes/origin/"):]
+    except Exception:
+        pass
+    # Last resort: try main then master
+    for candidate in ("main", "master"):
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", candidate],
+            cwd=repo_root, capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            return candidate
+    return "master"
+
+
 def get_diff(repo_root: str, branch: str = None) -> str:
     """获取diff内容，原样返回给LLM"""
     try:
         if branch:
-            cmd = ["git", "diff", f"master...{branch}"]
+            base = _default_branch(repo_root)
+            cmd = ["git", "diff", f"{base}...{branch}"]
         else:
             cmd = ["git", "diff", "HEAD~1"]
         result = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True)
@@ -152,7 +183,8 @@ def get_changed_files(repo_root: str, branch: str = None) -> list[str]:
     """获取changed files列表"""
     try:
         if branch:
-            cmd = ["git", "diff", f"master...{branch}", "--name-only"]
+            base = _default_branch(repo_root)
+            cmd = ["git", "diff", f"{base}...{branch}", "--name-only"]
         else:
             cmd = ["git", "diff", "HEAD~1", "--name-only"]
         result = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True)

@@ -172,7 +172,7 @@ The plan in §4 addresses missing items either by building them or explicitly di
 
 ## 4. Work plan — May 14–18
 
-> **Cursor:** P1 wrap-up phase begins. **Priority 4 is fully done 2026-05-14** (Chunks A → B → C → D + P3 HTTP wrapper). Plan↔Review contract loop is end-to-end demoable. Remaining work: P1 docs (requirements.txt + README + design doc Tradeoffs + design doc Evaluation Against Brief) and a P5 design-only section. Estimate ~0.5 day. After that, the submission is shippable.
+> **Cursor:** P1 wrap-up phase. All 4 priorities + P3 wrapper + scalability hardening landed 2026-05-14. Late-day real-PR testing on vaadin/hilla #3429 + #4533 surfaced 8 production gaps (see §16) all of which were fixed in code (retry tuning, default-branch detect, GitHub write safety + allowlist, agent_error logging, file grouping + dedup as failed-experiment record). Plan↔Review contract loop is end-to-end demoable. Remaining work: `requirements.txt` ✓, `README.md`, design doc Tradeoffs + Evaluation-Against-Brief sections (can be largely synthesized from §16). Push to origin/main is gated by user decision.
 >
 > *Update this line as work progresses. Claude Code reads this on every "continue" request to find the next task.*
 
@@ -727,4 +727,135 @@ To answer during walk-through prep, not before:
 
 ---
 
-*Generated end of day May 14. Next session: §12 verification, then Priorities 1 → 6 in order.*
+## 16. Production-readiness lessons (2026-05-14, real-PR testing)
+
+After all 4 priorities landed, late-day testing on a real OSS repo (vaadin/hilla) exposed gaps the petclinic-toy demo never triggered. This section is the consolidated record: experiments run, what worked, what didn't, mitigations roadmap, and observability TODO. Negative results are kept — picking up *which hypothesis failed and why* is itself the take-home signal.
+
+### 16.1 Scalability experiments
+
+Setup: vaadin/hilla (Spring + React framework, ~1600 files post-scan). Three PRs at increasing sizes:
+
+| PR | Files | Diff lines | Role |
+|---|---|---|---|
+| `petclinic#1` | 1 | 5 | Toy baseline (already in demo state) |
+| `hilla#3429` | 5 | 328 | Medium |
+| `hilla#4533` | 26 | 6924 | Large stress |
+
+Five strategies measured on `hilla#4533`:
+
+| # | Strategy | Wallclock | LLM calls | Retries | Findings | Est. cost |
+|---|---|---|---|---|---|---|
+| 1 | Sonnet 4.6, single-shot, max_retries=4 (default at the start of the session) | 52s | 3/5 ✗ | 8 | 4 (2 stubs) | $0.30 |
+| 2 | Sonnet 4.6, single-shot, max_retries=6 + 60s backoff cap + Retry-After parsing | 275s | 5/5 ✓ | 7 | 7 | $0.65 |
+| 3 | **Opus 4.7, single-shot** | **35s** ✓ | 5/5 | 0 | 5 | $4.09 |
+| 4 | Sonnet + file grouping (4 groups × 4 agents) | 444s | 17 | 19 | 39 | $1.08 |
+| 5 | Sonnet + grouping + dedup | 449s | 17 | 23 | 31 | $1.08 |
+
+### 16.2 What worked
+
+- **Tuning the retry policy:** `max_retries` 4 → 6, backoff base 1s → 2s with `min(2**attempt * base, 60s)` cap, plus parsing the `Retry-After` header on 429 responses. Net: Sonnet 4.6 no longer drops agents on large PRs (strategy #2 vs #1).
+- **Model selection as a deliberate knob:** Opus 4.7's 500K ITPM (10× Sonnet) absorbs the 4-agent concurrent fan-out without rate-limiting at all (strategy #3). 8× faster than Sonnet, at 5–6× cost — the right trade for latency-critical interactive review; Sonnet better for batch/CI.
+- **GitHub write safety:** discovered the hard way that switching `GITHUB_REPO` env without restarting led to posting comments to a public OSS PR. Fixed with a **two-gate design**: `--post` flag / `REVIEW_POST_COMMENTS=true` env opt-in (off by default) **and** a `REVIEW_ALLOWED_REPOS` allowlist enforced in `github_client.is_post_allowed_repo()`. Either gate closed = no write. Public-OSS write attempt now blocks with a clear "BLOCKED by allowlist" message even when the user explicitly passes `--post`.
+- **Default branch detection:** `scanner._default_branch()` now auto-detects via `git symbolic-ref refs/remotes/origin/HEAD`, falling back to `main` then `master`. Was hardcoded to `master`; hilla uses `main`.
+- **Observability hook:** `BaseAgent.review`'s except path now writes an `agent_error` event to `execution_log` capturing exception type + message + whether it was a rate-limit. Closes the gap where the original exception text was being thrown away inside `error_finding`'s in-memory-only fields.
+
+### 16.3 What didn't work — file grouping (kept in code, default-disabled, honest record)
+
+Hypothesized: split large PRs into ≤10-file / ≤40K-char groups and run agents per-group serially. Result: **strategies #4 and #5 are worse than the simple retry approach in every dimension** (wallclock, cost, retries, signal-to-noise of findings).
+
+Why grouping didn't help:
+
+1. **Anthropic ITPM is a rolling 60-second window.** Sequential groups still drain the same input-tokens budget within that minute. Group 1 leaves 50K tokens used; group 2 starts 30s later and tips the limit. Retries still trigger.
+2. **Per-group selector + boilerplate overhead.** 17 LLM calls vs 5 for single-shot. The selector runs once (good) but every group re-sends the 12K diff prefix + 4 agents × ~3K boilerplate, doubling input cost without proportional value.
+3. **Output token explosion.** Each agent sees 4 different file slices and produces findings on each, yielding 39 raw findings (vs 7 single-shot). Dedup by `(agent, file, line)` only catches the obvious overlap (39 → 31) because LLMs produce semantically similar but textually different findings on related code — exact-match dedup is the wrong tool.
+
+The grouping code is preserved (with thresholds raised so it doesn't fire in default settings) as an artifact of the failed experiment, not pretending we didn't try. To make grouping useful would require *paired* fixes: lower concurrency inside each group, OR semantic-similarity dedup (likely another LLM call), OR a smarter "shared-context, sharded-findings" pattern none of the existing tools we surveyed do well.
+
+### 16.4 Rate-limit mitigation roadmap (TODO, ranked by expected ROI)
+
+Mitigations identified during testing but outside this delivery's scope:
+
+| Approach | Idea | Why it might work |
+|---|---|---|
+| **Anthropic prompt caching** | Mark long static prompt prefixes (system prompt, repo_profile, memory injection block) with `cache_control: ephemeral`. Cached input tokens count against a separate, much larger limit. | Highest expected ROI — could cut effective input ITPM 60–90% on review workloads where the prompt prefix is mostly static across calls. The Anthropic SDK supports it natively. |
+| **Diff-only review mode** | Drop full `file_contents`; agents see only the patch hunks (already truncated to 12K chars) + a small context window. | Cuts input tokens 70%+ on large PRs. Trade-off: agents can't see what's *around* the change. Probably the right default for PRs > 30 files. |
+| **Adaptive concurrency** | Pre-flight estimate of total input tokens; if > 50K predicted, drop `max_concurrent` from 5 → 2 (or 1) so calls fit within rate window. | Solves rate-limit deterministically. Wallclock cost: ceil(N/2) × per-call latency vs concurrent. |
+| **Multi-account / API-key rotation** | Round-robin across multiple `ANTHROPIC_API_KEY`s (different orgs or higher-tier keys). | Linearly scales ITPM. Operationally messy (key management, attribution). |
+| **Small-PR culture** | Enforce a PR-size limit (e.g., 500 lines) via CI / pre-receive hook. | Doesn't change the tool, but most real review tools assume small PRs anyway. Cultural change is the cheapest fix when it lands. |
+| **Tier upgrade** | Anthropic Tier 4+ rate limits. | Money, not engineering. Worth mentioning so reviewers know it's a knob. |
+| **Anthropic Batches API** | The bulk asynchronous API for offline reviews has no synchronous rate limit. | Wrong for interactive review (turnaround hours), right for nightly batch / on-merge CI scans. |
+
+### 16.5 Observability — current state vs proposed roadmap
+
+**Current state (in place, working):**
+- `execution_log` table with timestamped events: `agent_selection`, `agent_result`, `agent_retry`, `agent_error` (new, captures exception text), `contract_status`.
+- `_raw_response` (first 8K) + `_stop_reason` captured inside reasoning JSON on every successful agent call.
+- `logs <task_id>` command renders execution_log as a flat timeline.
+- LLM `usage_summary()` printed at the end of every `build` and `review` (requests, tokens in/out, retries, timeouts, budget blocks).
+
+**Industry survey (synthesized from training knowledge of LangSmith, Phoenix, W&B Weave, Helicone, Langfuse, OTel GenAI semconv) → recommended data model:**
+
+```sql
+ALTER TABLE execution_log ADD COLUMN trace_id        TEXT;
+ALTER TABLE execution_log ADD COLUMN parent_span_id  TEXT;
+ALTER TABLE execution_log ADD COLUMN span_id         TEXT;
+ALTER TABLE execution_log ADD COLUMN kind            TEXT;  -- 'agent' | 'llm' | 'retrieval' | 'contract'
+
+CREATE TABLE llm_call (
+  span_id        TEXT PRIMARY KEY,
+  trace_id       TEXT NOT NULL,
+  agent_name     TEXT NOT NULL,
+  model          TEXT NOT NULL,
+  max_tokens     INTEGER,
+  messages_json  TEXT NOT NULL,           -- full input messages (captures prompts we currently throw away)
+  response_text  TEXT NOT NULL,           -- full response (not truncated to 8K)
+  input_tokens   INTEGER,
+  output_tokens  INTEGER,
+  latency_ms     INTEGER,
+  finish_reason  TEXT,
+  created_at     TIMESTAMP NOT NULL
+);
+```
+
+Borrowed patterns:
+- **LangSmith** — single recursive table with `parent_id` covers chain/llm/tool/retriever uniformly.
+- **Phoenix** — `kind` enum tells the renderer what node to draw and which nodes can be replayed.
+- **Helicone** — wrap the SDK at the choke-point so prompts can't be dropped accidentally.
+- **Langfuse** — observation discriminator column fits SQLite cleanly.
+- **OTel GenAI** — adopt `gen_ai.request.model`, `gen_ai.usage.input_tokens`, etc. naming so future OTel export is rename-free.
+- **W&B Weave** — cost rollup from leaf to root (future enhancement).
+
+### 16.6 Observability TODO
+
+- [ ] Wrap `client.messages.create()` once at the SDK boundary to capture every prompt + response — closes the gap where prompts are built then discarded.
+- [ ] Migrate `execution_log` schema: add `trace_id` / `span_id` / `parent_span_id` / `kind`.
+- [ ] Add `llm_call` table for full prompt/response/usage capture (replaces the truncated 8K `_raw_response` field).
+- [ ] CLI `trace show <task_id>` — render `execution_log` as a tree via `parent_span_id`; expand LLM nodes inline.
+- [ ] CLI `trace replay <span_id> [--edit]` — only when `kind='llm'`. Load `messages_json` into `$EDITOR`, re-invoke client, diff against original `response_text`. Don't try to replay non-LLM spans (LangSmith and Weave both gave up on that).
+- [ ] Adopt OpenTelemetry GenAI attribute names — free future-proofing.
+- [ ] Add `synth_result` event to `execution_log` (P4 Chunk C's Synthesizer is currently a black box).
+- [ ] Persist `reflect` accept/reject events with timestamp + reason — currently SQLite-only via the `accepted` column, no audit trail in execution_log.
+- [ ] Cross-task `trace_id` — link a `build` task with subsequent `review` tasks that consume its contract. Closes the "trace_id = task_id, no cross-task linking" gap noted earlier.
+
+### 16.7 Memory layer limitations (documented; left as design discussion)
+
+Already in the system, not fixed in this delivery, recorded honestly:
+
+- **No eviction.** planning_memory / findings_memory / corrections_memory grow unbounded. Semantic retrieval still functions at 10K+ records but relevance degrades. Future: per-collection LRU + cron prune, or `archive_old_plans()` helper.
+- **No per-engineer / per-team namespacing.** Same-repo memory is shared across all reviewers. Future: add `user_id` / `team_id` metadata + filter at query time. This is Priority 5 in the original plan (design-only section).
+- **No memory freshness hint to the LLM.** Retrieved corrections might be 6 months stale; the agent doesn't know. Future: include `days_old` in the formatted memory text.
+- **No memory compaction.** Many similar corrections accumulate over time. Future: periodic re-clustering + merging via LLM call.
+- **No access control.** Anyone running `build` reads what was previously stored. Correct for a single-developer tool, worth flagging for team deployment.
+
+### 16.8 Other production gaps from this session
+
+| Gap | Discovered when | Mitigation |
+|---|---|---|
+| Default branch hardcoded to `master` | hilla uses `main` | Auto-detect via `git symbolic-ref refs/remotes/origin/HEAD`, fallback to `main` then `master`. Fixed in `scanner/repo_scanner.py:_default_branch()`. |
+| GitHub URL hardcoded in success message | Showed `jessejia1991/...` even when GITHUB_REPO=vaadin/hilla | Now reads from env. Fixed in `cli/review_cmd.py`. |
+| GitHub write safety | Accidentally posted comments to vaadin/hilla PR #3429 during a test run | Two-gate safety: `--post`/`--no-post` CLI flag + `REVIEW_POST_COMMENTS=true` env opt-in + `REVIEW_ALLOWED_REPOS` allowlist. Default behavior is no-write. |
+| Agent failure swallowed exception text | error_finding lived in-memory only, status="failed" got filtered before save | `agent_error` event now logged from BaseAgent except path with exception type + text + rate-limit flag. |
+
+---
+
+*Generated end of day May 14. Next session: backfill design doc (.docx) Tradeoffs and Evaluation-Against-Brief sections from §16, plus README.*

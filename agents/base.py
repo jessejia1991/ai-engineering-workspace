@@ -61,6 +61,24 @@ class BaseAgent(ABC):
             return findings, reasoning
 
         except Exception as e:
+            # Observability fix: log the actual exception so failures are
+            # diagnosable from the trace. error_finding goes into in-memory
+            # all_findings but gets filtered before save (status='failed'),
+            # so without this log line the exception text would vanish.
+            try:
+                import anthropic
+                from database import log_execution
+                await log_execution(task.task_id, "agent_error", self.name, {
+                    "exception_type":  type(e).__name__,
+                    "exception_text":  str(e)[:2000],
+                    "is_rate_limit":   isinstance(e, anthropic.RateLimitError),
+                    "is_api_status":   isinstance(e, anthropic.APIStatusError),
+                    "had_owned_criteria": bool(owned_criteria),
+                })
+            except Exception:
+                # never let observability cascade — original error is more important
+                pass
+
             error_finding = AgentFinding(
                 finding_id=str(uuid.uuid4())[:8],
                 task_id=task.task_id,

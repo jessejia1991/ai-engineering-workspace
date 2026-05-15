@@ -41,6 +41,34 @@ def get_pr_description(pr_number: int) -> str:
         return ""
 
 
+def is_post_allowed_repo() -> tuple[bool, str]:
+    """
+    Defense-in-depth allowlist for write paths. Returns (allowed, reason).
+    Even if a caller sets `REVIEW_POST_COMMENTS=true` or passes --post,
+    we refuse to post unless GITHUB_REPO is explicitly listed in
+    REVIEW_ALLOWED_REPOS (comma-separated). Discovered the hard way:
+    accidentally posted to a public OSS repo during scalability testing
+    because env was switched but a CLI flag wasn't.
+    """
+    repo = os.environ.get("GITHUB_REPO", "")
+    if not repo:
+        return False, "GITHUB_REPO env var is not set"
+    allowed = os.environ.get("REVIEW_ALLOWED_REPOS", "")
+    if not allowed:
+        return False, (
+            "REVIEW_ALLOWED_REPOS env var is not set; refusing to write to "
+            f"'{repo}' as a safety default. Add the repo to "
+            "REVIEW_ALLOWED_REPOS (comma-separated) to enable posting."
+        )
+    allowed_list = [r.strip() for r in allowed.split(",") if r.strip()]
+    if repo not in allowed_list:
+        return False, (
+            f"GITHUB_REPO='{repo}' is not in REVIEW_ALLOWED_REPOS "
+            f"({allowed_list}). Refusing to write."
+        )
+    return True, ""
+
+
 def post_review_comments(
     pr_number: int,
     findings: list[AgentFinding],
@@ -49,8 +77,16 @@ def post_review_comments(
     """
     Post findings as PR review comments on specific file+line.
     Post overall RiskReport as a PR review summary.
-    Returns True if successful.
+    Returns True if successful, False if blocked or failed.
+
+    Safety: refuses unless GITHUB_REPO is in REVIEW_ALLOWED_REPOS env
+    (defense-in-depth — caller-level --post flag is not enough on its own).
     """
+    allowed, reason = is_post_allowed_repo()
+    if not allowed:
+        print(f"[post_review_comments] BLOCKED by allowlist: {reason}")
+        return False
+
     try:
         repo = get_repo()
         pr   = repo.get_pull(pr_number)
