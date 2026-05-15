@@ -256,6 +256,23 @@ def scan(repo_root: str = None) -> dict:
     # 4. 加载历史corrections
     corrections = load_corrections()
 
+    # 5. Static runtime + API extraction (verify slice). Both are best-effort —
+    #    a failure inside either should not break scan.
+    try:
+        from scanner.runtime_detector import detect_runtime
+        runtime = detect_runtime(repo_root)
+    except Exception:
+        runtime = {}
+    try:
+        from scanner.api_extractor import extract_apis
+        # Limit extraction to backend files — controllers don't live in tests
+        # or build artifacts. Frontend files (Express) are inspected too if
+        # they match the pattern.
+        candidate_files = classification["backend"] + classification["frontend"]
+        apis = extract_apis(repo_root, files=candidate_files)
+    except Exception:
+        apis = []
+
     profile = {
         "repo_id": os.path.basename(repo_root),
         "repo_path": repo_root,
@@ -275,6 +292,10 @@ def scan(repo_root: str = None) -> dict:
 
         # 历史上记录的理解偏差
         "corrections": corrections,
+
+        # Verify slice: how to build/run/test + what APIs exist
+        "runtime": runtime,
+        "apis":    apis,
 
         "scanned_at": datetime.now().isoformat()
     }

@@ -31,14 +31,15 @@ The take-home asks for an AI-powered engineering workspace — a multi-agent sys
 
 The system reviews PRs by running specialized agents in parallel against a diff, surfacing findings to a human in a `reflect` step, and feeding the human's accept/reject decisions back into long-lived memory so subsequent reviews improve. Three architectural ideas matter most:
 
-### 2.1 Four-layer memory (ChromaDB), repo-scoped
+### 2.1 Five-layer memory (ChromaDB), repo-scoped
 
 | Layer | Scope | Grows when | Used at |
 |---|---|---|---|
 | `findings_memory` | per-agent, per-repo | Any finding saved during a review | Retrieval before each agent runs |
-| `corrections_memory` | per-agent (global), per-repo | Human rejects a finding in `reflect` with a reason; user may `p+` to pin | Retrieval before each agent runs |
+| `corrections_memory` | per-agent (global), per-repo | Human rejects a finding in `reflect` with a reason; user may `p+` to pin. Also: `verify run` failure-analysis writes `test-gen-lesson` entries here. | Retrieval before each agent runs; `verify generate` retrieves `test-gen-lesson` entries |
 | `repo_profile` | per-repo (file system, not ChromaDB) | `scan` command | Injected into every prompt |
 | `planning_memory` | per-repo | Each `build` invocation on approve — stores raw requirement, clarify Q&A (if any), final graph summary, and user edits made | Queried inside `planner.py` before the LLM call to inject top-K similar past builds and their resolution patterns |
+| `test_catalog` | per-repo (strict isolation — tests don't generalize) | `verify generate` adds one entry per generated e2e test | `verify run --diff` queries by APIs touched in diff; `verify catalog search` does semantic lookup |
 
 **Repo isolation + hierarchical retrieval (memory slice, 2026-05-15).** Every entry carries a `repo_id` metadata. Retrieval is two-phase: phase 1 returns own-repo hits (`where={"repo_id": active}`), phase 2 fills remaining slots from the cross-repo pool. Returned items are tagged `origin='own'/'cross'` and `format_memory_for_prompt` renders `[own-repo]` / `[cross-repo]` markers so the LLM can weight the two pools differently. Rationale: engineering wisdom like "trivial getters don't need unit tests" generalizes; throwing it away on a strict isolation boundary wastes signal.
 
@@ -93,13 +94,15 @@ ai-engineering-workspace/
 ├── cli/
 │   ├── build_cmd.py             (885)  P2/P4 build pipeline + Architect Report UX + Contract editing
 │   ├── init_cmd.py              (290)  5-step setup wizard (keys, model, first repo); auto-triggered on missing key
-│   ├── main.py                  (335)  Interactive shell + dispatch + first-run init auto-trigger
-│   ├── memory_cmd.py            (190)  `memory {stats,prune,compact}` — maintenance over the 3 collections
+│   ├── main.py                  (340)  Interactive shell + dispatch + first-run init auto-trigger
+│   ├── memory_cmd.py            (190)  `memory {stats,prune,compact}` — maintenance over the memory collections
 │   ├── memory_compact.py        (250)  LLM-driven cluster-merge of corrections (used by `memory compact`)
 │   ├── reflect_cmd.py           (210)  Human triage UI + correction write-back + pin (`p+`)
 │   ├── repo_cmd.py              (190)  `repo {list,add,use,remove}` — registry-side entity management
 │   ├── review_cmd.py            (316)  Run a review on a PR + GitHub post (allowlist-gated)
-│   └── trace_cmd.py             (435)  `trace show` / `trace replay` observability CLI
+│   ├── trace_cmd.py             (435)  `trace show` / `trace replay` observability CLI
+│   ├── verify_cmd.py            (320)  `verify generate` — LLM produces Python pytest e2e tests
+│   └── verify_run.py            (350)  `verify run` + failure analysis + `verify list` + `verify catalog search`
 ├── database.py                  (455)  aiosqlite schema + helpers (tasks · findings · exec_log · graphs · observations)
 ├── github_client.py             (206)  Post review comments to GitHub (two-gate safety)
 ├── memory/
@@ -110,7 +113,9 @@ ai-engineering-workspace/
 │   ├── planner.py               (598)  P2 single-pass planner + P4 plan_with_experts + Synthesizer
 │   └── runner.py                (534)  run_review pipeline + find_graph_for_pr auto-match
 ├── scanner/
-│   └── repo_scanner.py          (301)  scan, classify, repo_profile, _default_branch auto-detect
+│   ├── api_extractor.py         (270)  OpenAPI YAML + Spring annotation + Express route extraction
+│   ├── repo_scanner.py          (320)  scan, classify, repo_profile, _default_branch auto-detect; integrates runtime + apis
+│   └── runtime_detector.py      (210)  build/run/test command detection (Maven/npm/Python/Docker/CI)
 └── tests/
     └── test_memory.py                  Standalone vector_store smoke test
 ```
@@ -181,7 +186,7 @@ The individual files have been smoke-tested in prior conversations, but **end-to
 | Architecture review | ✓ done — ArchitectureAgent (review-side: layering / coupling / module-boundary) + plan-phase angle via `build_requirement_prompt` |
 | Regression detection | ⚠ reframed — corrections_memory + Contract enforcement together provide regression-of-known-issue detection without a dedicated agent; documented as architectural choice in design doc (no separate RegressionAgent) |
 | Refactoring recommendations | ✓ done — RefactoringAgent (method/file scope: naming, duplication, dead code, type-safety) |
-| CI/CD validation, deployment checks | ✗ out of scope (would mean parsing GHA YAML or running CI checks — separate project); design doc future work |
+| CI/CD validation, deployment checks | ✓ partial — `verify generate` produces Python e2e tests targeting detected APIs; `verify run` pytest-executes them against a running target ($VERIFY_TARGET_URL); `verify run` failure-analysis classifies test-bug-* vs regression and feeds lessons back into next-generation prompt. Lifecycle of the target system is the user's responsibility (deliberate scope decision — "we are an external tester, not a deployment automation tool") |
 | Risk scoring | ✓ `RiskReport` rendered as a panel at end of every review (severity-weighted, with merge recommendation) |
 
 **Explicit evaluation dimensions:**
@@ -222,7 +227,7 @@ The plan in §4 addresses missing items either by building them or explicitly di
 
 ## 4. Work plan — May 14–18
 
-> **Cursor:** P1 wrap-up phase. All 4 priorities + P3 wrapper + scalability hardening + observability slice + memory slice + `init` wizard + brief-coverage slice (ArchitectureAgent + RefactoringAgent + TestGenerationAgent) landed 2026-05-14/15. §3.4 coverage table now ✓ on 9 of 11 brief workflows; Test execution + CI/CD are explicit OOS; regression detection is reframed as "covered by corrections_memory + Contract" — design doc to elaborate. Plan↔Review contract loop is end-to-end demoable. Remaining work: `README.md` + design doc Tradeoffs + Evaluation-Against-Brief sections. Push to origin/main is gated by user decision.
+> **Cursor:** P1 wrap-up phase. All 4 priorities + P3 wrapper + scalability hardening + observability slice + memory slice + `init` wizard + brief-coverage slice (Architecture/Refactoring/TestGeneration agents) + **verify slice** (runtime + API detection at scan time; external Python e2e test generation; pytest run + failure-analysis loop; `test_catalog` 5th memory layer) all landed 2026-05-14/15. §3.4 coverage now ✓ on **10 of 11** brief workflows (only test execution stays partial — we run our own generated e2e tests, not the project's internal test suite, which is a deliberate scope decision). Plan↔Review contract loop + Verify loop both end-to-end demoable. Remaining work: `README.md` + design doc Tradeoffs + Evaluation-Against-Brief sections. Push to origin/main is gated by user decision.
 >
 > *Update this line as work progresses. Claude Code reads this on every "continue" request to find the next task.*
 
@@ -1112,6 +1117,68 @@ Each follows the existing `BaseAgent` pattern (~80-115 LoC). ArchitectureAgent a
 A dedicated RegressionAgent would have overlapped with both. Design doc records this as an architectural choice. The user is separately thinking about what additional definition of "regression" they want — that may unlock a future agent.
 
 **Token cost note.** Adding 3 agents increases per-review cost. The selector skipping unnecessary agents keeps this bounded — on small diffs only 3-4 agents fire; on big diffs all 8 might. The HTTP-layer wrapper (P3) still enforces session-wide concurrency cap and optional `ANTHROPIC_TOKEN_BUDGET`, so the worst case is graceful degradation, not runaway cost.
+
+### 16.12 Verify slice landed 2026-05-15
+
+Externally-driven e2e testing as the project's CD-validation surface. Reframes the brief's "CI/CD validation workflows" into something demoable and useful: instead of parsing GitHub Actions YAML, we extract the target system's operational picture (build/run/test commands + API surface) and generate Python e2e tests that hit the running system from outside.
+
+**Key architectural decisions (locked in 2026-05-15 conversation):**
+
+| Question | Decision |
+|---|---|
+| Where do generated tests live? | `.ai-workspace/generated-tests/<repo_id>/` — workspace-scoped, never pollutes the target repo |
+| What's the testing language? | Python + pytest + `requests` regardless of target system's language (we're an external tester) |
+| Who manages the target system's lifecycle? | User. Demo flow: user runs `mvn spring-boot:run` (or similar) in another terminal, our tool points at `$VERIFY_TARGET_URL` (default `http://localhost:8080` or detected port). Reason: sandbox adaptation is a separate project; we focus on the AI loop |
+| Test-payload strategy | Bias toward **generic, high-signal** checks that don't require domain knowledge: GET → 200 + JSON shape; POST/PUT empty body → 4xx (validation works); /{id} → 404 for nonexistent. Happy-path POST with full payload is the LLM's weakest angle (doesn't know real schemas) |
+| Failure handling | After `verify run`, each FAILED test gets an LLM analysis pass. Classification: `test-bug-script` / `test-bug-payload` / `test-bug-config` / `regression` / `flaky`. Only `script` + `payload` write a `test-gen-lesson` to corrections_memory (those are actionable at next-generation time); `config` is environmental, `regression` is a real bug to surface, `flaky` is noise |
+| API extraction priority | OpenAPI YAML/JSON if present (most accurate; petclinic uses openapi-codegen) > Spring annotation regex > Express route regex. Higher-priority source wins on (method, path) collisions |
+
+**5th memory layer:** `test_catalog`. Strict repo-isolation (a test for petclinic doesn't apply to hilla). Two query modes:
+- Deterministic: `query_tests_by_apis([POST /api/visits, ...])` — exact-match on APIs covered. Used by `verify run --diff` for impact selection.
+- Semantic: `query_tests_by_description("notes field validation")` — ChromaDB top-K over the catalog's flow descriptions. Used by `verify catalog search`.
+
+**Verified on petclinic** (Spring Boot + React + OpenAPI spec, 2026-05-15):
+
+```
+scan
+→ Runtime: react + spring-boot · port 9966
+→ APIs:    36 endpoints (6 DELETE, 14 GET, 9 POST, 7 PUT)
+
+verify generate --no-diff --max 2
+→ Generated 2 Python pytest files in .ai-workspace/generated-tests/spring-petclinic-reactjs/
+→ test_owners_crud.py + test_vets_and_specialties.py
+→ Each covers 3-5 endpoints, includes validation + 404 + happy-path GET
+
+verify run             # without the server running (intentional, exercises analyzer)
+→ All tests FAILED with ConnectionRefusedError
+→ Per-test failure analysis: classified all as TEST-BUG-CONFIG
+→ Lesson NOT saved (config = environmental, not generation-actionable)
+→ Suggestion to user: start the service or set VERIFY_TARGET_URL
+
+verify list
+→ Catalog table: 2 entries, both FAIL with last_run timestamp
+
+verify catalog search "list owners returns JSON"
+→ test_owners_crud sim=0.40, test_vets_and_specialties sim=0.20
+```
+
+**The closed loop** (regression detection in a fuller sense):
+1. PR touches `VisitController.java` → diff
+2. `verify generate --diff` produces a new test for the touched API (or reuses existing one in catalog)
+3. `verify run --diff` queries catalog for tests covering `POST /api/visits` etc., runs them
+4. Test fails → analyzer classifies → if test-bug-payload, lesson goes to corrections_memory
+5. Next `verify generate --diff` retrieves that lesson into its prompt → smarter test code → fewer test-bugs over time
+6. Test catalog accumulates across PRs → coverage grows → regression net widens
+
+**What's deliberately not done:**
+
+| Item | Why |
+|---|---|
+| Target-system spin-up / teardown (Popen-based) | Sandbox adaptation is its own project; demo assumes user runs the system |
+| Custom CI YAML parsing (GHA, Travis, Drone) | Not the AI value-add — that's a parser project. We detect *presence* of CI config files (recorded in `runtime.ci_config`), nothing more |
+| Multi-language test generation (JUnit, Jest natively) | We chose to **always** generate Python, since we test from outside. Project language doesn't matter |
+| Happy-path POST with full payloads | LLM-without-schema-context produces too many false negatives. Validation tests are more reliable and still cover the API surface |
+| Generated-test execution as a step inside `review` | Two separate flows by design (locked in conversation). Review = fast static analysis. Verify = slow runtime-against-deployed |
 
 ### 16.8 Other production gaps from this session
 

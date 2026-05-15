@@ -1,0 +1,554 @@
+"""
+`verify run` + `verify list` + `verify catalog search`.
+
+run flow:
+  1. Resolve target URL (--url > $VERIFY_TARGET_URL > detected port default).
+  2. Select tests (--diff via catalog query_tests_by_apis; default = all).
+  3. subprocess pytest -v --tb=short on the generated-tests dir, env VERIFY_TARGET_URL set.
+  4. Parse stdout for PASSED/FAILED lines.
+  5. Update test_catalog last_run_at + last_status for each test.
+  6. For each FAILED test (unless --no-analyze): LLM call classifies
+     test-bug-* / regression / flaky / config. test-bug-* writes a
+     correction to corrections_memory (type='test-gen-lesson') so next
+     `verify generate` is smarter.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import json
+import uuid
+import subprocess
+from pathlib import Path
+from datetime import datetime
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich import box
+
+from database import init_db, get_active_repo
+from scanner.repo_scanner import load_profile, get_changed_files
+from memory.vector_store import (
+    list_catalog_entries, query_tests_by_apis, query_tests_by_description,
+    update_test_run_status, add_correction,
+)
+from agents.llm_client import client as llm_client, set_trace_context
+
+console = Console()
+
+WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
+GENERATED_TESTS_ROOT = WORKSPACE_ROOT / ".ai-workspace" / "generated-tests"
+
+
+# ---------- verify run --------------------------------------------------
+
+async def run_verify_run(rest: list[str]) -> None:
+    use_diff = False
+    url: str | None = None
+    do_analyze = True
+    select_all = False
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == "--diff":
+            use_diff = True; i += 1
+        elif a == "--url" and i + 1 < len(rest):
+            url = rest[i + 1]; i += 2
+        elif a == "--no-analyze":
+            do_analyze = False; i += 1
+        elif a == "--select" and i + 1 < len(rest):
+            if rest[i + 1] == "all":
+                select_all = True
+            i += 2
+        else:
+            console.print(f"[red]Unknown flag: {a}[/red]")
+            return
+
+    await init_db()
+    active = await get_active_repo()
+    if not active:
+        console.print("[red]No active repo set. Run [bold]repo use <id>[/bold] first.[/red]")
+        return
+    repo_id = active["id"]
+
+    # Resolve URL: --url > env > runtime.port default
+    try:
+        profile = load_profile()
+    except FileNotFoundError:
+        profile = {}
+    runtime = profile.get("runtime") or {}
+    if not url:
+        url = os.environ.get("VERIFY_TARGET_URL")
+    if not url:
+        port = runtime.get("port", 8080)
+        url = f"http://localhost:{port}"
+
+    # Test selection
+    repo_dir = GENERATED_TESTS_ROOT / repo_id
+    if not repo_dir.is_dir() or not any(repo_dir.glob("test_*.py")):
+        console.print(
+            f"[red]No generated tests under {repo_dir.relative_to(WORKSPACE_ROOT)}.[/red] "
+            f"Run [bold]verify generate[/bold] first."
+        )
+        return
+
+    selected_files: list[Path] = []
+    if use_diff and not select_all:
+        apis_in_diff = _apis_for_diff(profile)
+        if not apis_in_diff:
+            console.print(
+                "[yellow]No APIs detected as impacted by current diff — "
+                "falling back to running all generated tests.[/yellow]"
+            )
+            selected_files = sorted(repo_dir.glob("test_*.py"))
+        else:
+            hits = query_tests_by_apis(apis_in_diff, repo_id)
+            wanted = {(h.get("metadata") or {}).get("file_path", "") for h in hits}
+            wanted = {WORKSPACE_ROOT / w for w in wanted if w}
+            selected_files = [p for p in sorted(repo_dir.glob("test_*.py"))
+                              if p in wanted]
+            if not selected_files:
+                console.print(
+                    "[yellow]Catalog had no test covering the diff APIs — "
+                    "running all generated tests instead.[/yellow]"
+                )
+                selected_files = sorted(repo_dir.glob("test_*.py"))
+    else:
+        selected_files = sorted(repo_dir.glob("test_*.py"))
+
+    console.print(Panel.fit(
+        f"[bold]verify run[/bold]  "
+        f"repo={repo_id} · url={url} · selected={len(selected_files)} test file(s)",
+        border_style="blue",
+    ))
+
+    # Build pytest command
+    env = os.environ.copy()
+    env["VERIFY_TARGET_URL"] = url
+    cmd = [
+        "pytest", "-v", "--tb=short",
+        "--no-header",
+        *[str(p) for p in selected_files],
+    ]
+    console.print(f"  [dim]$ VERIFY_TARGET_URL={url} pytest {' '.join(p.name for p in selected_files)}[/dim]\n")
+
+    try:
+        proc = subprocess.run(
+            cmd, env=env, cwd=str(WORKSPACE_ROOT),
+            capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        console.print("[red]pytest timed out after 120s[/red]")
+        return
+    except FileNotFoundError:
+        console.print(
+            "[red]pytest not found in PATH.[/red] "
+            "Install: [bold]pip install pytest requests[/bold]"
+        )
+        return
+
+    stdout = proc.stdout
+    stderr = proc.stderr
+
+    results = _parse_pytest_output(stdout)
+
+    # Render results
+    table = Table(box=box.SIMPLE_HEAVY, show_header=True, title="Test results")
+    table.add_column("Status", style="bold", width=8, justify="center")
+    table.add_column("Test", style="white")
+    table.add_column("Detail", style="dim")
+    n_pass = n_fail = n_err = 0
+    for r in results:
+        status_color = {
+            "PASSED":  "[green]✓ PASS[/green]",
+            "FAILED":  "[red]✗ FAIL[/red]",
+            "ERROR":   "[red]! ERR[/red]",
+            "SKIPPED": "[dim]- SKIP[/dim]",
+        }.get(r["status"], r["status"])
+        table.add_row(status_color, r["test"], r.get("detail", "")[:80])
+        if r["status"] == "PASSED":
+            n_pass += 1
+        elif r["status"] == "FAILED":
+            n_fail += 1
+        elif r["status"] == "ERROR":
+            n_err += 1
+    console.print(table)
+    console.print(
+        f"[bold]{n_pass} passed · {n_fail} failed · {n_err} errored[/bold]"
+    )
+
+    # Update catalog last_run for each test FILE (one file may have many
+    # test functions; we roll up to file-level status).
+    file_status = _rollup_file_status(results, selected_files)
+    for fp, status in file_status.items():
+        test_id = _test_id_from_file(fp, repo_id)
+        if test_id:
+            update_test_run_status(test_id, status)
+
+    # Failure analysis loop
+    failures = [r for r in results if r["status"] in ("FAILED", "ERROR")]
+    if failures and do_analyze:
+        console.print("\n[bold]Analyzing failures...[/bold]")
+        for f in failures:
+            await _analyze_failure(f, stdout, repo_id, url)
+    elif failures:
+        console.print(
+            "\n[dim]Pass --analyze to LLM-classify failures and write "
+            "lessons to corrections_memory.[/dim]"
+        )
+
+
+def _apis_for_diff(profile: dict) -> list[str]:
+    """Map diff-changed files to APIs they own."""
+    apis = profile.get("apis") or []
+    try:
+        changed = get_changed_files(profile.get("repo_path", ""))
+    except Exception:
+        return []
+    if not changed:
+        return []
+    chf_lower = " ".join(changed).lower()
+    out = []
+    for a in apis:
+        handler = (a.get("handler") or "").lower()
+        file_   = (a.get("file") or "").lower()
+        handler_class = handler.split(".")[0] if "." in handler else handler
+        if (file_ and any(file_ in cf.lower() for cf in changed)) or \
+           (handler_class and handler_class in chf_lower):
+            out.append(f"{a['method']} {a['path']}")
+    return out
+
+
+# ---------- pytest output parsing ----------------------------------------
+
+# Match lines like:
+#   .ai-workspace/generated-tests/petclinic/test_x.py::test_foo PASSED   [ 50%]
+#   .ai-workspace/generated-tests/petclinic/test_x.py::test_foo FAILED
+_PYTEST_LINE_RE = re.compile(
+    r"^(?P<file>[\w./\-]+\.py)::(?P<test>[\w_]+)\s+(?P<status>PASSED|FAILED|ERROR|SKIPPED)"
+)
+
+
+def _parse_pytest_output(stdout: str) -> list[dict]:
+    results: list[dict] = []
+    for line in stdout.splitlines():
+        m = _PYTEST_LINE_RE.search(line)
+        if not m:
+            continue
+        results.append({
+            "file":   m.group("file"),
+            "test":   f"{Path(m.group('file')).name}::{m.group('test')}",
+            "status": m.group("status"),
+            "detail": "",
+        })
+    # Pull failure detail from FAILED block
+    fail_blocks = re.split(r"^_{5,}\s+([\w./:]+)\s+_{5,}$", stdout, flags=re.MULTILINE)
+    # Best-effort — leave detail empty if parsing fails. The full trace
+    # is captured in stdout and fed to the analysis step.
+    return results
+
+
+def _rollup_file_status(results: list[dict], files: list[Path]) -> dict[Path, str]:
+    """Per-file: any FAIL → FAIL; any ERROR → ERROR; else PASS."""
+    by_file: dict[str, list[str]] = {}
+    for r in results:
+        by_file.setdefault(r["file"], []).append(r["status"])
+    out: dict[Path, str] = {}
+    for f in files:
+        rel = str(f.relative_to(WORKSPACE_ROOT))
+        statuses = by_file.get(rel, [])
+        if not statuses:
+            out[f] = "UNKNOWN"
+        elif "ERROR" in statuses:
+            out[f] = "ERROR"
+        elif "FAILED" in statuses:
+            out[f] = "FAIL"
+        else:
+            out[f] = "PASS"
+    return out
+
+
+def _test_id_from_file(fp: Path, repo_id: str) -> str | None:
+    """Reverse-lookup catalog entry by file path."""
+    target = str(fp.relative_to(WORKSPACE_ROOT))
+    for e in list_catalog_entries(repo_id=repo_id):
+        if (e.get("metadata") or {}).get("file_path") == target:
+            return e["id"]
+    return None
+
+
+# ---------- failure analysis loop ---------------------------------------
+
+ANALYZE_PROMPT = """You are debugging a failed e2e test that targeted a running system.
+
+## Target URL the test hit
+{url}
+
+## The test that failed
+File: {file}
+Test name: {test_name}
+
+## Pytest output (full failure trace; may include stdout, stderr, traceback)
+```
+{trace}
+```
+
+## Test source (the actual code that ran)
+```python
+{source}
+```
+
+## Your task
+Classify this failure. Pick exactly ONE category:
+
+- **test-bug-script**: The test code itself has a bug (typo, wrong import,
+  syntax error, wrong assertion semantics). The system being tested is
+  fine. Fix is in the test code.
+
+- **test-bug-payload**: The test sent a payload/url shape the API doesn't
+  accept (e.g., wrong content-type, wrong field name, missing required
+  parameter the test couldn't have known about from the spec alone).
+  System is fine; future test generations should know the right shape.
+
+- **test-bug-config**: Wrong URL, wrong port, missing auth header, the
+  target service isn't actually running on the configured host, etc.
+  Environmental, not the system's fault.
+
+- **regression**: The test is correct and the system actually broke.
+  The expected behavior is not happening. Real production bug.
+
+- **flaky**: Transient — network timeout, race condition, timing
+  dependency. Re-running would likely succeed.
+
+## Output format — STRICT JSON
+{{
+  "category":     "test-bug-script | test-bug-payload | test-bug-config | regression | flaky",
+  "reasoning":    "one to three sentences explaining the classification with evidence from the trace",
+  "lesson":       "if category is test-bug-*, a single short sentence stating the rule future test generations should follow. Empty string for regression/flaky.",
+  "fix_hint":     "if category is test-bug-*, a concrete change to the test code. If regression, what to look at in the codebase. Empty for flaky."
+}}
+
+No prose, no fences. Just the JSON.
+"""
+
+
+async def _analyze_failure(failure: dict, full_stdout: str, repo_id: str, url: str) -> None:
+    """One LLM call per failed test. Writes lesson to corrections_memory if
+    test-bug-*. Surfaces regression for the human."""
+    file_path = WORKSPACE_ROOT / failure["file"]
+    try:
+        source = file_path.read_text(encoding="utf-8", errors="ignore")[:4000]
+    except Exception:
+        source = "<unreadable>"
+
+    # Pull the relevant section of pytest output (trace for this test only)
+    trace = _extract_trace_for_test(full_stdout, failure["test"])
+
+    prompt = ANALYZE_PROMPT.format(
+        url=url, file=failure["file"], test_name=failure["test"],
+        trace=trace[:3500], source=source,
+    )
+
+    trace_id = f"verify-analyze-{uuid.uuid4().hex[:8]}"
+    set_trace_context(trace_id=trace_id, agent_name="FailureAnalyzer")
+
+    try:
+        response = await llm_client.messages.create(
+            model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```", 1)[1]
+            if raw.lower().startswith("json"):
+                raw = raw[4:]
+            if "```" in raw:
+                raw = raw.split("```", 1)[0]
+        data = json.loads(raw)
+    except Exception as e:
+        console.print(
+            f"  [yellow]⚠ Failure analysis failed: {type(e).__name__}: {e}[/yellow]"
+        )
+        return
+
+    cat = data.get("category", "unknown")
+    reasoning = data.get("reasoning", "")
+    lesson = data.get("lesson", "")
+    fix = data.get("fix_hint", "")
+
+    # Render verdict
+    cat_color = {
+        "regression":       "red",
+        "test-bug-script":  "yellow",
+        "test-bug-payload": "yellow",
+        "test-bug-config":  "yellow",
+        "flaky":            "dim",
+    }.get(cat, "white")
+    console.print(Panel(
+        f"[bold {cat_color}]{cat.upper()}[/bold {cat_color}]\n\n"
+        f"{reasoning}\n\n"
+        f"[dim]Fix hint:[/dim] {fix or '(none)'}",
+        title=f"Analysis: {failure['test']}",
+        border_style=cat_color,
+    ))
+
+    # Persist learning. Only generation-actionable categories produce
+    # lessons: test-bug-script (the LLM wrote bad test code) and
+    # test-bug-payload (the LLM guessed the wrong API shape). test-bug-config
+    # is an environment problem — saving it would dilute corrections_memory
+    # with rules future generation can't act on. regression / flaky also skip.
+    if cat in ("test-bug-script", "test-bug-payload") and lesson:
+        try:
+            corr_id = "lesson-" + uuid.uuid4().hex[:8]
+            add_correction(
+                correction_id=corr_id,
+                note=lesson,
+                example=f"Failure in {failure['test']} ({cat}): {reasoning[:200]}",
+                correction_type="test-gen-lesson",
+                repo_id=repo_id,
+                pinned=False,
+            )
+            console.print(
+                f"  [dim]→ Lesson saved to corrections_memory: {lesson[:80]}[/dim]"
+            )
+        except Exception as e:
+            console.print(f"  [yellow]⚠ Could not save lesson: {e}[/yellow]")
+    elif cat == "test-bug-config":
+        console.print(
+            "  [dim]Config issue — not saving as generation lesson "
+            "(env, not test-code).[/dim]"
+        )
+
+
+def _extract_trace_for_test(stdout: str, test_label: str) -> str:
+    """Crude extraction: grab the section of pytest output mentioning this
+    test. If we can't pin a tight window, return the last 3.5K of stdout."""
+    test_name = test_label.split("::")[-1]
+    idx = stdout.find(test_name)
+    if idx < 0:
+        return stdout[-3500:]
+    start = max(0, idx - 200)
+    end = min(len(stdout), idx + 3500)
+    return stdout[start:end]
+
+
+# ---------- verify list -------------------------------------------------
+
+async def run_verify_list(rest: list[str]) -> None:
+    repo_id: str | None = None
+    i = 0
+    while i < len(rest):
+        if rest[i] == "--repo" and i + 1 < len(rest):
+            repo_id = rest[i + 1]; i += 2
+        else:
+            console.print(f"[red]Unknown flag: {rest[i]}[/red]")
+            return
+
+    if not repo_id:
+        await init_db()
+        active = await get_active_repo()
+        if not active:
+            console.print("[red]No active repo and no --repo flag.[/red]")
+            return
+        repo_id = active["id"]
+
+    entries = list_catalog_entries(repo_id=repo_id)
+    if not entries:
+        console.print(
+            f"[dim]Test catalog for repo '{repo_id}' is empty. "
+            f"Run [bold]verify generate[/bold] to populate.[/dim]"
+        )
+        return
+
+    table = Table(box=box.SIMPLE_HEAVY, show_header=True,
+                  title=f"Test catalog · repo={repo_id}")
+    table.add_column("Test ID",  style="cyan bold")
+    table.add_column("Status",   style="white", justify="center")
+    table.add_column("APIs covered", style="dim")
+    table.add_column("Description", style="white", overflow="fold")
+    table.add_column("Last run",   style="dim", width=19)
+
+    for e in entries:
+        m = e.get("metadata") or {}
+        status_raw = m.get("last_status", "UNKNOWN")
+        status = {
+            "PASS":    "[green]PASS[/green]",
+            "FAIL":    "[red]FAIL[/red]",
+            "ERROR":   "[red]ERR[/red]",
+            "UNKNOWN": "[dim]—[/dim]",
+        }.get(status_raw, status_raw)
+        last_run = (m.get("last_run_at") or "")[:19]
+        table.add_row(
+            e["id"],
+            status,
+            m.get("apis_covered", ""),
+            e.get("document", "")[:80].replace("Tests ", ""),
+            last_run,
+        )
+    console.print(table)
+
+
+# ---------- verify catalog search ---------------------------------------
+
+async def run_verify_catalog(rest: list[str]) -> None:
+    if not rest or rest[0] != "search":
+        console.print("[red]Usage: verify catalog search \"<query>\" [--repo X][/red]")
+        return
+    rest = rest[1:]
+    if not rest:
+        console.print("[red]Need a query string.[/red]")
+        return
+
+    query_parts: list[str] = []
+    repo_id: str | None = None
+    i = 0
+    while i < len(rest):
+        if rest[i] == "--repo" and i + 1 < len(rest):
+            repo_id = rest[i + 1]; i += 2
+        else:
+            query_parts.append(rest[i]); i += 1
+    query = " ".join(query_parts).strip().strip('"').strip("'")
+    if not query:
+        console.print("[red]Empty query.[/red]")
+        return
+
+    if not repo_id:
+        await init_db()
+        active = await get_active_repo()
+        if not active:
+            console.print("[red]No active repo and no --repo flag.[/red]")
+            return
+        repo_id = active["id"]
+
+    hits = query_tests_by_description(query, repo_id, top_k=10)
+    if not hits:
+        console.print(f"[dim]No catalog entries match '{query}'.[/dim]")
+        return
+
+    table = Table(box=box.SIMPLE_HEAVY, show_header=True,
+                  title=f"Semantic search · query='{query}'")
+    table.add_column("Sim",      style="cyan", width=6, justify="right")
+    table.add_column("Test ID",  style="bold")
+    table.add_column("Status",   width=8, justify="center")
+    table.add_column("APIs",     style="dim")
+    table.add_column("Description", style="white", overflow="fold")
+
+    for h in hits:
+        m = h.get("metadata") or {}
+        status_raw = m.get("last_status", "UNKNOWN")
+        status = {
+            "PASS":  "[green]PASS[/green]",
+            "FAIL":  "[red]FAIL[/red]",
+            "ERROR": "[red]ERR[/red]",
+        }.get(status_raw, "[dim]—[/dim]")
+        table.add_row(
+            f"{h.get('similarity', 0):.2f}",
+            h["id"],
+            status,
+            (m.get("apis_covered") or "")[:40],
+            h.get("document", "")[:80].replace("Tests ", ""),
+        )
+    console.print(table)

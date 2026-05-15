@@ -125,6 +125,8 @@ def _interactive_shell():
             asyncio.run(_cmd_repo(args))
         elif cmd == "memory":
             asyncio.run(_cmd_memory(args))
+        elif cmd == "verify":
+            asyncio.run(_cmd_verify(args))
         elif cmd == "init":
             asyncio.run(_cmd_init())
         else:
@@ -152,6 +154,9 @@ def _print_help():
     table.add_row("memory stats [--repo X]",      "Memory counts per collection / per repo")
     table.add_row("memory prune [--dry-run]",     "LRU evict from memory (pinned + young protected)")
     table.add_row("memory compact",               "LLM-driven cluster merge of duplicate corrections")
+    table.add_row("verify generate [--diff]",     "Generate Python e2e tests for detected APIs (diff-scoped)")
+    table.add_row("verify run [--diff]",          "Run tests vs $VERIFY_TARGET_URL; analyze + learn from failures")
+    table.add_row("verify list / catalog search", "Inspect test catalog · semantic search by flow")
     table.add_row("init",                         "Re-run the setup wizard (keys, model, first repo)")
     table.add_row("exit",                         "Exit the shell")
     console.print(table)
@@ -218,6 +223,15 @@ async def _cmd_scan():
         console.print(f"\n[yellow]⚠ {len(profile['corrections'])} correction(s) loaded[/yellow]")
     else:
         console.print("\n[dim]No corrections recorded yet.[/dim]")
+
+    # Verify slice: surface runtime + API detection in the scan output.
+    runtime = profile.get("runtime") or {}
+    apis    = profile.get("apis") or []
+    if runtime or apis:
+        from scanner.runtime_detector import runtime_summary
+        from scanner.api_extractor    import apis_summary
+        console.print(f"\n[bold]Runtime:[/bold] {runtime_summary(runtime)}")
+        console.print(f"[bold]APIs:[/bold]    {apis_summary(apis)}")
 
     console.print(f"\n[green]✓ Profile saved to .ai-workspace/repo-context.json[/green]")
     console.print(f"[dim]Scanned at: {profile['scanned_at']}[/dim]\n")
@@ -291,6 +305,11 @@ async def _cmd_repo(args: list[str]):
 async def _cmd_memory(args: list[str]):
     from cli.memory_cmd import cmd_memory
     await cmd_memory(args)
+
+
+async def _cmd_verify(args: list[str]):
+    from cli.verify_cmd import cmd_verify
+    await cmd_verify(args)
 
 
 async def _cmd_init():

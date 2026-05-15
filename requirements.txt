@@ -19,3 +19,8 @@ rich>=15.0.0
 # Config + integrations
 python-dotenv>=1.2.0
 PyGithub>=2.9.0            # PR diff + description fetch
+PyYAML>=6.0                # OpenAPI spec parsing for API extraction (verify slice)
+
+# Verify slice — external e2e tests against the target system
+requests>=2.31             # HTTP client used inside generated tests
+pytest>=7.4                # test runner; we invoke it via subprocess

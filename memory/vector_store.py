@@ -38,6 +38,7 @@ _client = None
 _findings_collection = None
 _corrections_collection = None
 _planning_collection = None
+_test_catalog_collection = None
 _init_lock = threading.RLock()
 
 
@@ -73,6 +74,28 @@ def get_corrections_collection():
                     metadata={"hnsw:space": "cosine"}
                 )
     return _corrections_collection
+
+
+def get_test_catalog_collection():
+    """
+    5th memory layer (verify slice): catalog of generated e2e tests.
+    Each entry = one test file. Document text = "Tests <flow description>".
+    Metadata: repo_id, test_id, apis_covered (comma-separated),
+    file_path, generated_at, last_run_at, last_status (PASS/FAIL/UNKNOWN).
+
+    Strict repo-isolation at the query layer — a test for repo A doesn't
+    generalize to repo B (different APIs, different payloads). Cross-repo
+    fallback that other layers use is disabled here at the caller level.
+    """
+    global _test_catalog_collection
+    if _test_catalog_collection is None:
+        with _init_lock:
+            if _test_catalog_collection is None:
+                _test_catalog_collection = get_client().get_or_create_collection(
+                    name="test_catalog",
+                    metadata={"hnsw:space": "cosine"}
+                )
+    return _test_catalog_collection
 
 
 def get_planning_collection():
@@ -189,6 +212,129 @@ def add_plan(
             "pinned":          False,
         }]
     )
+
+
+# ===================================================================
+# Test catalog (verify slice) — 5th memory layer.
+# ===================================================================
+
+def add_test_to_catalog(
+    test_id: str,
+    description: str,
+    apis_covered: list[str],
+    file_path: str,
+    repo_id: str,
+    generated_at: str | None = None,
+) -> None:
+    """
+    Register a generated test. document = "Tests <description>" so semantic
+    search by intent ("notes field validation") finds it.
+    apis_covered comes in as ["POST /api/pets", "GET /api/pets/{id}"] —
+    flattened to a comma-separated string because ChromaDB metadata is
+    primitive-typed.
+    """
+    coll = get_test_catalog_collection()
+    now = _now_ts()
+    coll.add(
+        ids=[test_id],
+        documents=[f"Tests {description}"],
+        metadatas=[{
+            "repo_id":       repo_id,
+            "test_id":       test_id,
+            "apis_covered":  ",".join(apis_covered) if apis_covered else "",
+            "file_path":     file_path,
+            "generated_at":  generated_at or datetime.now().isoformat(),
+            "last_run_at":   "",
+            "last_status":   "UNKNOWN",
+            "timestamp":     now,
+        }]
+    )
+
+
+def update_test_run_status(test_id: str, status: str,
+                           last_run_at: str | None = None) -> None:
+    """Bump last_run_at + last_status on a catalog entry. Swallow errors —
+    catalog updates are best-effort, must not block `verify run`."""
+    try:
+        coll = get_test_catalog_collection()
+        coll.update(
+            ids=[test_id],
+            metadatas=[{
+                "last_run_at": last_run_at or datetime.now().isoformat(),
+                "last_status": status,
+            }],
+        )
+    except Exception:
+        pass
+
+
+def list_catalog_entries(repo_id: str | None = None) -> list[dict]:
+    """All entries (id + document + metadata), optionally filtered to one
+    repo. Used by `verify list`."""
+    coll = get_test_catalog_collection()
+    try:
+        where = {"repo_id": repo_id} if repo_id else None
+        res = coll.get(where=where, include=["documents", "metadatas"])
+    except Exception:
+        return []
+    out = []
+    docs  = res.get("documents") or []
+    metas = res.get("metadatas") or []
+    for i, eid in enumerate(res.get("ids", []) or []):
+        out.append({
+            "id":       eid,
+            "document": docs[i]  if i < len(docs)  else "",
+            "metadata": metas[i] if i < len(metas) else {},
+        })
+    return out
+
+
+def query_tests_by_apis(apis: list[str], repo_id: str) -> list[dict]:
+    """
+    Deterministic impact selection: given a list of API specs
+    (["POST /api/pets", ...]), return catalog entries whose
+    `apis_covered` overlaps. ChromaDB doesn't do substring filters
+    well, so we pull all entries for the repo and filter in Python.
+    """
+    if not apis:
+        return []
+    needle = set(apis)
+    entries = list_catalog_entries(repo_id=repo_id)
+    hits = []
+    for e in entries:
+        covered_raw = (e.get("metadata") or {}).get("apis_covered", "")
+        covered = {c.strip() for c in covered_raw.split(",") if c.strip()}
+        if covered & needle:
+            hits.append(e)
+    return hits
+
+
+def query_tests_by_description(query_text: str, repo_id: str,
+                               top_k: int = 5) -> list[dict]:
+    """Semantic search over test_catalog documents. Strict repo-isolation."""
+    coll = get_test_catalog_collection()
+    try:
+        total = coll.count()
+        if total == 0:
+            return []
+        raw = coll.query(
+            query_texts=[query_text],
+            n_results=min(top_k, total),
+            where={"repo_id": repo_id},
+        )
+        return _apply_time_decay(raw, origin="own")
+    except Exception:
+        return []
+
+
+def delete_test_from_catalog(test_id: str) -> bool:
+    """Used when `verify generate` regenerates an existing test (replaces)."""
+    try:
+        coll = get_test_catalog_collection()
+        coll.delete(ids=[test_id])
+        return True
+    except Exception:
+        return False
 
 
 # ===================================================================
@@ -504,6 +650,7 @@ def list_entries(collection_name: str, repo_id: str | None = None) -> list[dict]
         "findings":     get_findings_collection(),
         "corrections":  get_corrections_collection(),
         "planning":     get_planning_collection(),
+        "test_catalog": get_test_catalog_collection(),
     }.get(collection_name)
     if coll is None:
         raise ValueError(f"unknown collection: {collection_name}")
@@ -533,6 +680,7 @@ def delete_entries(collection_name: str, ids: list[str]) -> int:
         "findings":     get_findings_collection(),
         "corrections":  get_corrections_collection(),
         "planning":     get_planning_collection(),
+        "test_catalog": get_test_catalog_collection(),
     }.get(collection_name)
     if coll is None:
         raise ValueError(f"unknown collection: {collection_name}")
@@ -544,10 +692,10 @@ def delete_entries(collection_name: str, ids: list[str]) -> int:
 
 
 def delete_repo_entries(repo_id: str) -> dict[str, int]:
-    """Wipe everything tagged with this repo_id across all 3 collections.
+    """Wipe everything tagged with this repo_id across all 4 collections.
     Used by `repo remove` when the user opts to purge cached memory."""
     counts = {}
-    for name in ("findings", "corrections", "planning"):
+    for name in ("findings", "corrections", "planning", "test_catalog"):
         entries = list_entries(name, repo_id=repo_id)
         ids = [e["id"] for e in entries]
         counts[name] = delete_entries(name, ids)

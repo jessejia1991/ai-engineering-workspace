@@ -8,3 +8,4 @@ reports/
 .ai-workspace/chroma_db/
 .ai-workspace/repo-context.json
 .ai-workspace/task-memory/
+.ai-workspace/generated-tests/
