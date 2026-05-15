@@ -39,12 +39,26 @@ def _rule_based_hints(changed_files: list[str]) -> dict:
         for f in changed_files
     )
 
+    # ArchitectureAgent signals: structural changes — new files, files in
+    # different packages (cross-package touching), or large diffs.
+    distinct_dirs = {os.path.dirname(f) for f in changed_files if "/" in f}
+    has_new_file_likely = any(
+        # Heuristic — we don't have git status here, but new entities /
+        # controllers in non-test paths are usually new functionality.
+        ("Controller" in f or "Service" in f or "Repository" in f)
+        and "test" not in f.lower()
+        for f in changed_files
+    )
+    crosses_packages = len(distinct_dirs) >= 3
+
     return {
-        "has_backend": has_backend,
-        "has_frontend": has_frontend,
-        "has_test_only": has_test_only,
-        "has_db": has_db,
-        "has_controller": has_controller,
+        "has_backend":         has_backend,
+        "has_frontend":        has_frontend,
+        "has_test_only":       has_test_only,
+        "has_db":              has_db,
+        "has_controller":      has_controller,
+        "crosses_packages":    crosses_packages,
+        "has_new_file_likely": has_new_file_likely,
     }
 
 
@@ -65,9 +79,12 @@ async def select_agents(
     available_agents = {
         "SecurityAgent": "Finds security issues: missing validation, auth problems, data exposure, injection risks",
         "BugFindingAgent": "Finds bugs: null handling, logic errors, missing error handling, edge cases",
-        "TestingAgent": "Reviews test coverage: missing tests, regression risks, weak assertions",
+        "TestingAgent": "Reviews existing test coverage: missing tests near the diff, weak assertions",
+        "TestGenerationAgent": "Proposes runnable new test code (JUnit/Jest/pytest) for changed behavior — pick when diff adds logic that isn't trivially covered",
         "PerformanceAgent": "Finds performance issues: N+1 queries, expensive loops, large payloads",
         "UIUXAgent": "Reviews UI/UX: loading states, error display, accessibility — ONLY for frontend changes",
+        "ArchitectureAgent": "Critiques structural concerns: layering violations, misplaced files, tight coupling, new module boundaries — pick when the diff crosses packages, introduces new top-level files, or touches public API shape",
+        "RefactoringAgent": "Method/file-scoped code-quality: long methods, duplication, naming, dead code, type-safety — pick for non-trivial code changes; skip for pure docs / config",
     }
 
     agents_text = "\n".join([f"- {name}: {desc}" for name, desc in available_agents.items()])
@@ -89,6 +106,8 @@ async def select_agents(
 - Has only test file changes: {hints['has_test_only']}
 - Has database/repository changes: {hints['has_db']}
 - Has controller/handler changes: {hints['has_controller']}
+- Crosses 3+ distinct directories: {hints['crosses_packages']}  (signal for ArchitectureAgent)
+- Likely new service/controller/repository file: {hints['has_new_file_likely']}  (signal for ArchitectureAgent + TestGenerationAgent)
 
 ## Diff summary
 {diff_summary[:500] if diff_summary else 'No diff available'}
@@ -101,9 +120,12 @@ async def select_agents(
 
 ## Rules
 - UIUXAgent MUST ONLY run when frontend files (.ts, .tsx, .js, .jsx in client/ or frontend/) are changed
-- If only test files changed, focus on TestingAgent and BugFindingAgent
+- If only test files changed, focus on TestingAgent and BugFindingAgent (TestGenerationAgent doesn't help — the tests ARE the change)
 - Always include at least one agent
 - SecurityAgent is especially important when controller or entity files change
+- ArchitectureAgent should fire on cross-package diffs or when new top-level service/controller files appear; skip for single-file localized changes
+- RefactoringAgent should fire on any non-trivial code change; skip for pure config / docs / generated code
+- TestGenerationAgent should fire when the diff adds behavior (new method, new branch, new endpoint) without adding tests in the same diff; skip on pure refactors / renames
 
 Select which agents should run and which should be skipped.
 For each skipped agent, provide a brief reason.
@@ -145,12 +167,19 @@ Return ONLY a JSON object in this exact format:
         )
 
     except Exception as e:
-        # Fallback: rule-based safe defaults if LLM selection fails
-        selected = ["SecurityAgent", "BugFindingAgent", "TestingAgent"]
+        # Fallback: rule-based safe defaults if LLM selection fails.
+        # Bias toward including the new agents — better to over-include
+        # than to miss coverage on a fallback path.
+        selected = ["SecurityAgent", "BugFindingAgent", "TestingAgent",
+                    "RefactoringAgent"]
         if hints["has_frontend"]:
             selected.append("UIUXAgent")
         if hints["has_db"]:
             selected.append("PerformanceAgent")
+        if hints.get("crosses_packages") or hints.get("has_new_file_likely"):
+            selected.append("ArchitectureAgent")
+        if not hints.get("has_test_only"):
+            selected.append("TestGenerationAgent")
 
         return AgentSelection(
             selected=selected,
@@ -189,6 +218,15 @@ _PERF_KEYWORDS = [
     "concurrent", "throughput", "latency", "hot path", "query", "cache",
     "pagination", "n+1",
 ]
+# Architecture lens fires when the requirement implies structural change,
+# not just additive feature work. The plan phase always benefits from a
+# Security / Testing / Delivery angle, but Architecture should be paid
+# for only when there's a real structural decision to make.
+_ARCH_KEYWORDS = [
+    "module", "package", "boundary", "layer", "refactor", "restructure",
+    "migration", "new service", "abstract", "interface", "rename ",
+    "extract", "split", "merge", "rewrite", "cross-cutting", "middleware",
+]
 
 
 def select_experts_for_plan(requirement: str, repo_profile: dict) -> AgentSelection:
@@ -225,6 +263,17 @@ def select_experts_for_plan(requirement: str, repo_profile: dict) -> AgentSelect
         )
     else:
         skipped["PerformanceAgent"] = "no backend or perf vocabulary in requirement"
+
+    has_arch = any(w in req for w in _ARCH_KEYWORDS)
+    if has_arch:
+        selected.append("ArchitectureAgent")
+        reasoning["ArchitectureAgent"] = (
+            "structural-change vocabulary detected (module / boundary / refactor / migration / etc.)"
+        )
+    else:
+        skipped["ArchitectureAgent"] = (
+            "no structural-change vocabulary — additive feature work doesn't need an architecture lens"
+        )
 
     return AgentSelection(
         selected=selected,

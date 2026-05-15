@@ -15,14 +15,20 @@ from agents.bug_finding import BugFindingAgent
 from agents.testing import TestingAgent
 from agents.uiux import UIUXAgent
 from agents.performance import PerformanceAgent
+from agents.architecture import ArchitectureAgent
+from agents.refactoring import RefactoringAgent
+from agents.test_generation import TestGenerationAgent
 from memory.vector_store import query_relevant_memory, query_relevant_plans
 
 AGENT_REGISTRY = {
-    "SecurityAgent":    SecurityAgent(),
-    "BugFindingAgent":  BugFindingAgent(),
-    "TestingAgent":     TestingAgent(),
-    "UIUXAgent":        UIUXAgent(),
-    "PerformanceAgent": PerformanceAgent(),
+    "SecurityAgent":        SecurityAgent(),
+    "BugFindingAgent":      BugFindingAgent(),
+    "TestingAgent":         TestingAgent(),
+    "UIUXAgent":            UIUXAgent(),
+    "PerformanceAgent":     PerformanceAgent(),
+    "ArchitectureAgent":    ArchitectureAgent(),
+    "RefactoringAgent":     RefactoringAgent(),
+    "TestGenerationAgent":  TestGenerationAgent(),
 }
 
 SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1}

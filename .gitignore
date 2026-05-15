@@ -6,3 +6,5 @@ __pycache__/
 reports/
 .ai-workspace/reflection-log.json
 .ai-workspace/chroma_db/
+.ai-workspace/repo-context.json
+.ai-workspace/task-memory/

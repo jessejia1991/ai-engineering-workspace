@@ -79,12 +79,15 @@ ai-engineering-workspace/
 ├── PROGRESS.md                        This file
 ├── requirements.txt
 ├── agents/
+│   ├── architecture.py          (115)  Layering / module-boundary / coupling concerns; plan-phase opt-in
 │   ├── base.py                  (466)  BaseAgent + review() / review_requirement() + reasoning schema + contract_block
 │   ├── bug_finding.py           ( 51)
 │   ├── delivery.py              ( 73)  P4 plan-phase-only expert (raises in review())
 │   ├── llm_client.py            (442)  P3 rate-limited wrapper + observability instrumentation (contextvars + write_observation)
 │   ├── performance.py           ( 88)
+│   ├── refactoring.py           ( 80)  Method/file-scoped quality: naming, dedup, dead code, type-safety
 │   ├── security.py              ( 96)
+│   ├── test_generation.py       ( 90)  Proposes runnable test code (JUnit/Jest/pytest) for changed behavior
 │   ├── testing.py               ( 86)
 │   └── uiux.py                  ( 87)
 ├── cli/
@@ -174,11 +177,11 @@ The individual files have been smoke-tested in prior conversations, but **end-to
 | UI/UX critique | ✓ done (UIUXAgent) |
 | Performance optimization | ✓ done (PerformanceAgent) |
 | PR review automation | ✓ done (GitHub post via `--post`, allowlist-gated) |
-| Test generation and execution | ⚠ TestingAgent does test *review* not *generation* — gap |
-| Architecture review | ⚠ partial — the multi-expert plan phase covers architecture *concerns* at requirement time (P4 Chunk B); no dedicated review-side architecture agent |
-| Regression detection | ✗ not built |
-| Refactoring recommendations | ✗ not built |
-| CI/CD validation, deployment checks | ✗ explicitly deferred (no CI integration in scope) |
+| Test generation and execution | ⚠ generation done (TestGenerationAgent — outputs runnable JUnit/Jest/pytest in `suggestion`); execution explicitly out of scope (sandboxing + cross-language runners are a separate project) |
+| Architecture review | ✓ done — ArchitectureAgent (review-side: layering / coupling / module-boundary) + plan-phase angle via `build_requirement_prompt` |
+| Regression detection | ⚠ reframed — corrections_memory + Contract enforcement together provide regression-of-known-issue detection without a dedicated agent; documented as architectural choice in design doc (no separate RegressionAgent) |
+| Refactoring recommendations | ✓ done — RefactoringAgent (method/file scope: naming, duplication, dead code, type-safety) |
+| CI/CD validation, deployment checks | ✗ out of scope (would mean parsing GHA YAML or running CI checks — separate project); design doc future work |
 | Risk scoring | ✓ `RiskReport` rendered as a panel at end of every review (severity-weighted, with merge recommendation) |
 
 **Explicit evaluation dimensions:**
@@ -219,7 +222,7 @@ The plan in §4 addresses missing items either by building them or explicitly di
 
 ## 4. Work plan — May 14–18
 
-> **Cursor:** P1 wrap-up phase. All 4 priorities + P3 wrapper + scalability hardening + observability slice + memory slice + `init` wizard (5-step setup with key verification + auto-trigger on missing `ANTHROPIC_API_KEY`) landed 2026-05-14/15. PROGRESS.md §16.6 + §16.7 items mostly ticked. Plan↔Review contract loop is end-to-end demoable. Remaining work: `README.md` (now substantially smaller since `init` handles the quickstart step) + design doc Tradeoffs + Evaluation-Against-Brief sections. Push to origin/main is gated by user decision.
+> **Cursor:** P1 wrap-up phase. All 4 priorities + P3 wrapper + scalability hardening + observability slice + memory slice + `init` wizard + brief-coverage slice (ArchitectureAgent + RefactoringAgent + TestGenerationAgent) landed 2026-05-14/15. §3.4 coverage table now ✓ on 9 of 11 brief workflows; Test execution + CI/CD are explicit OOS; regression detection is reframed as "covered by corrections_memory + Contract" — design doc to elaborate. Plan↔Review contract loop is end-to-end demoable. Remaining work: `README.md` + design doc Tradeoffs + Evaluation-Against-Brief sections. Push to origin/main is gated by user decision.
 >
 > *Update this line as work progresses. Claude Code reads this on every "continue" request to find the next task.*
 
@@ -1076,6 +1079,39 @@ review --pr 1              # second repo: gets [own-repo] (its own) + [cross-rep
 - **Synchronous compaction trigger inside `reflect`.** Was considered: "after N rejections, auto-suggest a compact run." Deferred — compact is a deliberate maintenance verb, not a side effect of triage. Cleaner mental model.
 - **`memory show <id>` to inspect a single entry.** Would be cheap, but `memory stats` + grepping ChromaDB is sufficient at current scale. Listed in design doc future work.
 - **Per-engineer / per-team layer.** Same metadata pattern would slot in (just add `user_id` to filter), but multi-tenancy semantics open a real design rabbit hole. Stays in design doc.
+
+### 16.11 Brief-coverage slice landed 2026-05-15
+
+Three new review-side agents to close the remaining gaps from §3.4 against the brief's "supported workflows" list:
+
+| Agent | Scope | Distinct from |
+|---|---|---|
+| **ArchitectureAgent** | Layering violations, misplaced files, tight coupling, module-boundary breaks, new cross-cutting concerns | Refactoring (method/file scope); Security (correctness) |
+| **RefactoringAgent** | Long methods, duplication, naming, dead code, type-safety upgrades, testability | Architecture (module scope); BugFinding (correctness) |
+| **TestGenerationAgent** | Proposes runnable test code in `suggestion` field — JUnit / Jest / pytest based on file ext | TestingAgent (reviews existing test coverage, doesn't propose new tests) |
+
+Each follows the existing `BaseAgent` pattern (~80-115 LoC). ArchitectureAgent also implements `build_requirement_prompt` so it can opt into plan-phase expert review when the requirement implies structural change (gated by `_ARCH_KEYWORDS` in agent_selector).
+
+**Selector updates:**
+- `_rule_based_hints` now signals `crosses_packages` (3+ distinct dirs in changed_files) and `has_new_file_likely` (new service / controller / repository file).
+- LLM selector prompt knows about all 8 agents + when to pick / skip each.
+- Fallback path (LLM selection fails) biases toward including the new agents — better over-include than miss coverage on a fallback.
+- Plan-phase: ArchitectureAgent added conditionally when requirement contains structural-change keywords (module / boundary / refactor / migration / etc.); skipped for pure additive feature work.
+
+**Selector behavior verified on petclinic PR #1** (single-file `Visit.java` change adding `notes` field):
+- Selected: SecurityAgent, BugFindingAgent, TestingAgent, **TestGenerationAgent**, **RefactoringAgent** (5/8)
+- Skipped with clean reasons: UIUX (backend-only), Performance (no perf signal), Architecture (single-file localized, no cross-package — exactly the right call)
+- 11 findings (vs 0 in the pre-slice baseline), Risk = HIGH, recommendation = request_changes
+- TestGeneration produced two complete runnable JUnit 5 tests (parameterized null/empty + happy-path round-trip) with correct imports and AssertJ assertions
+- Refactoring produced two specific findings: "TODO comment should be a constraint or tracked issue" + "accessor methods out of order vs class layout"
+- Cost: 6 LLM req · 9,734 in / 5,161 out tokens (vs baseline 4 req · 5,525 in / 1,577 out — +50% req, ~2× cost, but 3× more useful signal)
+
+**On "regression detection":** Deliberately not built as a separate agent. Two mechanisms already provide it:
+1. **`corrections_memory` retrieval at agent runtime** — when a new finding semantically matches a past rejected one, the retrieved correction goes into the prompt and the agent should suppress the duplicate. This is *regression-of-false-positive prevention*.
+2. **P4 Contract enforcement** — `must_have` criteria from plan phase are re-verified at review time; `FAIL` → `merge_recommendation = request_changes`. This is *regression-of-deliberate-requirement detection*.
+A dedicated RegressionAgent would have overlapped with both. Design doc records this as an architectural choice. The user is separately thinking about what additional definition of "regression" they want — that may unlock a future agent.
+
+**Token cost note.** Adding 3 agents increases per-review cost. The selector skipping unnecessary agents keeps this bounded — on small diffs only 3-4 agents fire; on big diffs all 8 might. The HTTP-layer wrapper (P3) still enforces session-wide concurrency cap and optional `ANTHROPIC_TOKEN_BUDGET`, so the worst case is graceful degradation, not runaway cost.
 
 ### 16.8 Other production gaps from this session
 
