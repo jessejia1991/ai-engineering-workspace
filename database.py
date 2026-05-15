@@ -203,6 +203,18 @@ async def get_pending_findings(task_id: str):
             return [dict(r) for r in rows]
 
 
+async def get_finding(finding_id: str) -> dict | None:
+    """Look up a single finding by id. Used by `apply` to retrieve the
+    suggestion + file/line that the user is asking the AI to apply."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM task_findings WHERE id=?", (finding_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+
 async def update_finding_accepted(finding_id: str, accepted: bool):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(

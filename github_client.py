@@ -105,11 +105,21 @@ def post_review_comments(
 
         for finding in valid_findings:
             emoji = SEVERITY_EMOJI.get(finding.severity, "⚪")
+            fid   = finding.finding_id
+            # The footer surfaces the finding_id and the `/apply` syntax
+            # so a human (or the workflow's issue_comment trigger) can
+            # auto-apply the suggested fix via cli/apply_cmd.py.
+            apply_hint = (
+                f"\n\n[ai-eng · finding `{fid}`] "
+                f"_Reply with `/apply {fid}` to auto-fix, "
+                f"or `/apply {fid} <extra instructions>` to refine._"
+            )
             body  = (
                 f"{emoji} **[{finding.severity.upper()}] {finding.title}**\n\n"
                 f"**Agent:** {finding.agent}  |  **Category:** `{finding.category}`\n\n"
                 f"{finding.detail}\n\n"
                 f"**Suggestion:** {finding.suggestion}"
+                f"{apply_hint}"
             )
             try:
                 pr.create_review_comment(
@@ -127,6 +137,7 @@ def post_review_comments(
                         f"File: `{finding.file}:{finding.line}`\n\n"
                         f"{finding.detail}\n\n"
                         f"**Suggestion:** {finding.suggestion}"
+                        f"{apply_hint}"
                     )
                     comments_posted += 1
                 except Exception:

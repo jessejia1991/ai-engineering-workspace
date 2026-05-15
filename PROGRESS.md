@@ -100,9 +100,10 @@ ai-engineering-workspace/
 │   ├── reflect_cmd.py           (210)  Human triage UI + correction write-back + pin (`p+`)
 │   ├── repo_cmd.py              (190)  `repo {list,add,use,remove}` — registry-side entity management
 │   ├── review_cmd.py            (316)  Run a review on a PR + GitHub post (allowlist-gated)
+│   ├── apply_cmd.py             (260)  /apply <finding_id> auto-fix: fetch PR comment, LLM patches file, --push to PR branch
 │   ├── trace_cmd.py             (435)  `trace show` / `trace replay` observability CLI
 │   ├── verify_cmd.py            (320)  `verify generate` — LLM produces Python pytest e2e tests
-│   └── verify_run.py            (350)  `verify run` + failure analysis + `verify list` + `verify catalog search`
+│   └── verify_run.py            (440)  `verify run` + failure analysis + `verify list` + `verify catalog search` + `verify health-check`
 ├── database.py                  (455)  aiosqlite schema + helpers (tasks · findings · exec_log · graphs · observations)
 ├── github_client.py             (206)  Post review comments to GitHub (two-gate safety)
 ├── memory/
@@ -227,7 +228,7 @@ The plan in §4 addresses missing items either by building them or explicitly di
 
 ## 4. Work plan — May 14–18
 
-> **Cursor:** P1 wrap-up phase. All 4 priorities + production-readiness + observability slice + memory slice + `init` wizard + brief-coverage slice + verify slice + **CI/CD Phase 1** (non-interactive click subcommands · `review --strict` · `verify health-check` · health endpoint detection + Architecture flag · catalog dedup · committed demo tests · self-hosted-runner workflow at `examples/petclinic-ci.yml`) all landed 2026-05-14/15. §3.4 now ✓ on **all 11** brief workflows. Plan↔Review contract loop + Verify loop + CI/CD pipeline all demoable. Remaining: Phase 2 `apply` command + README major section + design doc Tradeoffs + Evaluation-Against-Brief sections. Push to origin/main is gated by user decision.
+> **Cursor:** P1 wrap-up phase. All 4 priorities + production-readiness + observability slice + memory slice + `init` wizard + brief-coverage slice + verify slice + **CI/CD Phase 1 + 2** (non-interactive click subcommands · `review --strict` · `verify health-check` · health endpoint detection + Architecture flag · catalog dedup · committed demo tests · self-hosted-runner workflow at `examples/petclinic-ci.yml` · **`apply` command** for `/apply <finding_id>` comment-driven auto-fix with `--push` to PR branch) all landed 2026-05-14/15. §3.4 ✓ on all 11 brief workflows. Three reflection loops working end-to-end: review→reflect→corrections (review side), verify→failure-analysis→test-gen-lessons (verify side), review-comment→apply→PR-branch-commit (CI side). Remaining: README major section + design doc Tradeoffs + Evaluation-Against-Brief sections. **User direction: trim / adjust demo before writing those.** Push to origin/main is gated by user decision.
 >
 > *Update this line as work progresses. Claude Code reads this on every "continue" request to find the next task.*
 
@@ -1241,9 +1242,76 @@ $ python -m cli.main repo list
 
 Click subcommand surface aligns with interactive shell — same names + flags, same output, only difference is exit code propagation. No new behavior, all wiring.
 
-**Phase 2 still ahead (~3-4h):**
-- `cli/apply_cmd.py` — fetch PR comment by id, parse `/apply [extra-instruction]`, load finding from the corresponding TASK-PR<N>, LLM call to produce updated file content, diff, optional `--push` to PR branch.
-- README major section: "Demo with self-hosted runner" — install runner, register, set secrets, walk through the end-to-end loop.
+**Phase 2 landed 2026-05-15 (see §16.14).** README write-up still pending — deliberately deferred per user direction so the project can be trimmed + adjusted first.
+
+### 16.14 AI-apply loop landed 2026-05-15
+
+The third human-in-the-loop reflection loop in the system. Symmetric with `reflect` (review → human accept/reject) and `verify` (test failure → analysis → lesson), this one closes the loop on **applying suggested fixes back to the PR branch**.
+
+**Trigger flow:**
+
+```
+AI posts review comment with finding_id + /apply hint
+  ↓
+Human types: /apply f-7a3b   (or with extras: /apply f-7a3b also keep nullable)
+  ↓
+GHA issue_comment event → workflow `ai-apply` job
+  ↓
+python -m cli.main apply --pr N --comment-id C --target-path WORKSPACE --push
+  ↓
+1. Fetch comment body via PyGithub
+2. Parse /apply <finding_id> [extra instructions]
+3. Load finding from task_findings table
+4. Read target file at the target path
+5. LLM produces complete modified file content (honors extra instructions)
+6. Diff vs original, render to console
+7. If --push: git add + commit + push to PR branch
+```
+
+**Verified on petclinic (synthetic finding, real LLM call, 2026-05-15):**
+
+Input — finding "Notes field lacks length constraint; suggest @Size(max=2000)" + user extra "also keep it nullable".
+
+LLM produced this diff (16 lines total):
+```diff
++import jakarta.validation.constraints.Size;
+...
+-    @Column(name = "notes")
++    @Size(max = 2000)
++    @Column(name = "notes", nullable = true)
+     private String notes;
+```
+
+The agent: (1) added the right import in the right alphabetical position, (2) added `@Size(max=2000)` on the field, (3) honored the user's extra instruction by adding `nullable = true` to the existing `@Column`. No collateral changes elsewhere in the file.
+
+**Safety:**
+
+| Gate | Behavior |
+|---|---|
+| `REVIEW_ALLOWED_REPOS` allowlist | Same gate as `--post`. Out-of-allowlist target refuses to push even with `--push`. |
+| `--push` opt-in | Default is preview: write the file locally, render the diff, skip git operations. CI workflows pass `--push` to close the loop. |
+| Detached-HEAD refuse | If the target checkout is in detached-HEAD state, refuse to push (would create dangling commit). |
+| Single-file scope | One `/apply` = one finding = one file. Multi-file refactors out of scope. |
+| LLM output not validated pre-write | Fail-forward: write whatever the LLM produced. The next CI run on the new commit catches a broken build. |
+| `finding.criterion_id` ignored | Apply uses the finding's `file` + `suggestion`, not contract criteria. Contract enforcement remains a review-time concern. |
+
+**Workflow integration:**
+
+`examples/petclinic-ci.yml` already has the `ai-apply` job wired (Phase 1 commit included this forward-looking YAML). It fires on `issue_comment.created` when the body contains `/apply`, checks out the PR head ref, and invokes:
+
+```yaml
+python -m cli.main apply \
+  --pr ${{ github.event.issue.number }} \
+  --comment-id ${{ github.event.comment.id }} \
+  --target-path ${{ github.workspace }} \
+  --push
+```
+
+**What's still ahead:**
+
+- README major section: "Demo with self-hosted runner" — install runner, register, set secrets, walk through end-to-end loop. User explicitly deferred this so they can trim/adjust the project first.
+- Design doc Tradeoffs + Evaluation-Against-Brief sections.
+- Multi-finding `/apply f-abc f-def` batching, conflict resolution across files, pre-write syntax check — all future work.
 
 ### 16.8 Other production gaps from this session
 

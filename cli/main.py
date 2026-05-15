@@ -533,5 +533,19 @@ def _click_logs(task_id):
     asyncio.run(_cmd_logs(task_id))
 
 
+@cli.command(name="apply",
+             help="Auto-apply a review finding to the target repo (driven by a PR /apply comment).")
+@click.option("--pr", "pr_number", required=True, type=int, help="PR number")
+@click.option("--comment-id", required=True, type=int, help="GitHub comment id containing /apply <finding_id>")
+@click.option("--target-path", required=True, type=click.Path(exists=True, file_okay=False),
+              help="Local checkout of the target repo (the PR branch HEAD)")
+@click.option("--push/--no-push", default=False,
+              help="Commit + push to PR branch. Without --push, writes the file but skips git.")
+def _click_apply(pr_number, comment_id, target_path, push):
+    from cli.apply_cmd import cmd_apply
+    code = asyncio.run(cmd_apply(pr_number, comment_id, target_path, push=push))
+    sys.exit(int(code or 0))
+
+
 if __name__ == "__main__":
     cli()
