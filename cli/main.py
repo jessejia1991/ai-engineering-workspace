@@ -534,9 +534,11 @@ def _click_logs(task_id):
 
 
 @cli.command(name="apply",
-             help="Auto-apply a review finding to the target repo (driven by a PR /apply comment).")
+             help="Auto-apply review findings to the target repo (driven by a PR /apply comment).")
 @click.option("--pr", "pr_number", required=True, type=int, help="PR number")
-@click.option("--comment-id", required=True, type=int, help="GitHub comment id containing /apply <finding_id>")
+@click.option("--comment-id", required=True, type=int,
+              help="GitHub comment id of the /apply comment "
+                   "(bare /apply = ticked Apply Menu boxes; /apply <id> ... = explicit)")
 @click.option("--target-path", required=True, type=click.Path(exists=True, file_okay=False),
               help="Local checkout of the target repo (the PR branch HEAD)")
 @click.option("--push/--no-push", default=False,

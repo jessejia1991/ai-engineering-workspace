@@ -15,6 +15,11 @@ SEVERITY_EMOJI = {
     "low":      "🔵",
 }
 
+# Hidden marker on the Apply Menu comment. cli/apply_cmd.py locates the
+# menu by scanning PR comments for this string, so a bare `/apply` can
+# resolve which findings were ticked. Keep it in sync with apply_cmd.py.
+REVIEW_SUMMARY_MARKER = "<!-- ai-eng-review-summary -->"
+
 
 def get_repo():
     if not GITHUB_TOKEN:
@@ -99,20 +104,22 @@ def post_review_comments(
             print("No commits found on PR")
             return False
 
-        # Post individual findings as inline review comments
-        valid_findings = [f for f in findings if f.status == "ok" and f.file and f.line]
+        # Tier the findings so the PR doesn't drown in inline comments:
+        #   critical / high -> inline review comment on the code line
+        #   medium / low    -> Apply Menu only
+        # Every ok finding still shows up in the Apply Menu checkbox list,
+        # which is the single surface a reviewer uses to /apply fixes.
+        ok_findings = [f for f in findings if f.status == "ok"]
+        tier1 = [f for f in ok_findings if f.severity in ("critical", "high")]
         comments_posted = 0
 
-        for finding in valid_findings:
+        for finding in tier1:
             emoji = SEVERITY_EMOJI.get(finding.severity, "⚪")
             fid   = finding.finding_id
-            # The footer surfaces the finding_id and the `/apply` syntax
-            # so a human (or the workflow's issue_comment trigger) can
-            # auto-apply the suggested fix via cli/apply_cmd.py.
             apply_hint = (
                 f"\n\n[ai-eng · finding `{fid}`] "
-                f"_Reply with `/apply {fid}` to auto-fix, "
-                f"or `/apply {fid} <extra instructions>` to refine._"
+                f"_Reply `/apply {fid}` to auto-fix this one, or tick it in "
+                f"the Apply Menu comment and `/apply` the batch._"
             )
             body  = (
                 f"{emoji} **[{finding.severity.upper()}] {finding.title}**\n\n"
@@ -121,29 +128,39 @@ def post_review_comments(
                 f"**Suggestion:** {finding.suggestion}"
                 f"{apply_hint}"
             )
-            try:
-                pr.create_review_comment(
-                    body=body,
-                    commit=last_commit,
-                    path=finding.file,
-                    line=finding.line,
+            posted = False
+            if finding.file and finding.line:
+                try:
+                    pr.create_review_comment(
+                        body=body,
+                        commit=last_commit,
+                        path=finding.file,
+                        line=finding.line,
+                    )
+                    posted = True
+                except GithubException:
+                    posted = False
+            if not posted:
+                # Line not in diff (or no location) — fall back to PR comment.
+                loc = (
+                    f"`{finding.file}:{finding.line}`" if finding.file
+                    else "_(no file location)_"
                 )
-                comments_posted += 1
-            except GithubException as e:
-                # Line may not exist in diff — fall back to PR comment
                 try:
                     pr.create_issue_comment(
                         f"{emoji} **[{finding.severity.upper()}] {finding.title}**\n"
-                        f"File: `{finding.file}:{finding.line}`\n\n"
+                        f"File: {loc}\n\n"
                         f"{finding.detail}\n\n"
                         f"**Suggestion:** {finding.suggestion}"
                         f"{apply_hint}"
                     )
-                    comments_posted += 1
+                    posted = True
                 except Exception:
                     pass
+            if posted:
+                comments_posted += 1
 
-        # Post RiskReport summary as PR review
+        # Post RiskReport summary as a PR review — this is the merge verdict.
         summary = _format_risk_summary(risk_report, findings)
 
         event = "REQUEST_CHANGES" if risk_report.merge_recommendation != "approve" else "APPROVE"
@@ -157,6 +174,14 @@ def post_review_comments(
         except GithubException:
             # Fallback: post as issue comment
             pr.create_issue_comment(summary)
+
+        # Post the Apply Menu — one issue comment, a checkbox per ok finding.
+        # `/apply` (cli/apply_cmd.py) reads the ticked boxes from this comment.
+        if ok_findings:
+            try:
+                pr.create_issue_comment(_format_apply_menu(ok_findings))
+            except Exception as e:
+                print(f"Apply Menu post failed: {e}")
 
         return True
 
@@ -214,4 +239,39 @@ def _format_risk_summary(risk_report: RiskReport, findings: list[AgentFinding]) 
         "findings require human review before merging*"
     ]
 
+    return "\n".join(lines)
+
+
+def _format_apply_menu(findings: list[AgentFinding]) -> str:
+    """
+    Render the Apply Menu — one PR comment, a checkbox per ok finding. A
+    reviewer ticks the boxes they want and comments `/apply`; the
+    REVIEW_SUMMARY_MARKER on the first line lets cli/apply_cmd.py locate
+    this comment and read which boxes are checked.
+    """
+    lines = [
+        REVIEW_SUMMARY_MARKER,
+        "## 🤖 AI Review — Apply Menu",
+        "",
+        "Tick the fixes you want, then comment **`/apply`** on this PR — "
+        "the AI commits the checked fixes to the PR branch.",
+        "",
+        "_Prefer to pick explicitly? Comment `/apply <finding_id> "
+        "[<finding_id> …]`. Add free text after the ids to refine, "
+        "e.g. `/apply a1b2c3d4 keep the change minimal`._",
+        "",
+    ]
+    for f in findings:
+        emoji = SEVERITY_EMOJI.get(f.severity, "⚪")
+        if f.file and f.line:
+            loc = f"  `{f.file}:{f.line}`"
+        elif f.file:
+            loc = f"  `{f.file}`"
+        else:
+            loc = ""
+        lines.append(
+            f"- [ ] `{f.finding_id}` {emoji} **{f.severity.upper()}** "
+            f"{f.title}{loc} — _{f.agent}_"
+        )
+    lines += ["", "---", "*Generated by AI Engineering Workspace*"]
     return "\n".join(lines)
