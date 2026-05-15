@@ -16,6 +16,9 @@ and the same accumulating usage counter.
 import os
 import asyncio
 import time
+import uuid
+import json
+import contextvars
 from typing import Optional, Any
 
 import anthropic
@@ -23,6 +26,73 @@ from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+# --- Trace context (observability slice) -------------------------------
+#
+# Caller sets these via `set_trace_context(...)` before invoking the LLM;
+# the wrapper reads them off the contextvars when writing the observation
+# row. ContextVars propagate automatically across `await` and `asyncio.gather`,
+# so each concurrent agent gets its own isolated trace context.
+#
+# If no context is set (e.g., a smoke test calling client.messages.create
+# directly), the wrapper still does the API call but skips the DB write —
+# observations are best-effort, never load-bearing for the actual response.
+
+_trace_id_var:     contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("trace_id", default=None)
+_agent_name_var:   contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("agent_name", default=None)
+_parent_obs_var:   contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("parent_observation_id", default=None)
+# Set by `trace replay` to link a replayed generation back to its source obs.
+# Read by the wrapper's auto-write path; left None for normal agent calls.
+_replayed_from_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("replayed_from_id", default=None)
+
+
+_UNSET: Any = object()
+
+
+def set_trace_context(
+    trace_id: Any = _UNSET,
+    agent_name: Any = _UNSET,
+    parent_observation_id: Any = _UNSET,
+    replayed_from_id: Any = _UNSET,
+) -> dict:
+    """
+    Set selected fields of the current trace context. Pass only the fields
+    you want to override — unspecified fields stay at their current value.
+    Returns a dict of contextvar tokens; restore previous state with
+    `reset_trace_context(tokens)`.
+
+    Typical usage:
+      - Orchestrator entry sets `trace_id` + `agent_name='Orchestrator'`.
+      - Per-agent `review()` overrides just `agent_name=self.name`,
+        inheriting the orchestrator's trace_id.
+
+    Each agent runs in its own asyncio.Task (via asyncio.gather), so
+    contextvars copies isolate concurrent agents automatically — callers
+    do not have to reset unless they want strict scoping inside a single
+    task.
+    """
+    tokens: dict = {}
+    if trace_id is not _UNSET:
+        tokens["trace_id"] = _trace_id_var.set(trace_id)
+    if agent_name is not _UNSET:
+        tokens["agent_name"] = _agent_name_var.set(agent_name)
+    if parent_observation_id is not _UNSET:
+        tokens["parent_observation_id"] = _parent_obs_var.set(parent_observation_id)
+    if replayed_from_id is not _UNSET:
+        tokens["replayed_from_id"] = _replayed_from_var.set(replayed_from_id)
+    return tokens
+
+
+def reset_trace_context(tokens: dict) -> None:
+    if "trace_id" in tokens:
+        _trace_id_var.reset(tokens["trace_id"])
+    if "agent_name" in tokens:
+        _agent_name_var.reset(tokens["agent_name"])
+    if "parent_observation_id" in tokens:
+        _parent_obs_var.reset(tokens["parent_observation_id"])
+    if "replayed_from_id" in tokens:
+        _replayed_from_var.reset(tokens["replayed_from_id"])
 
 
 # --- Configuration via env, with sane defaults --------------------------
@@ -159,43 +229,77 @@ class RateLimitedAnthropicClient:
                     f"({used} tokens consumed); refusing new request"
                 )
 
-        async with self._semaphore:
-            for attempt in range(self.max_retries + 1):
-                try:
-                    response = await asyncio.wait_for(
-                        self._sdk.messages.create(**kwargs),
-                        timeout=self.request_timeout_s,
-                    )
-                    self._n_requests += 1
-                    usage = getattr(response, "usage", None)
-                    if usage is not None:
-                        self._input_tokens  += getattr(usage, "input_tokens",  0) or 0
-                        self._output_tokens += getattr(usage, "output_tokens", 0) or 0
-                    return response
+        # Capture trace context once at call entry — even if retries happen,
+        # one logical call == one observation row. observation_id is generated
+        # here so a hypothetical caller could read it back, but we mostly
+        # discover it later via the observations table.
+        observation_id  = "obs-" + uuid.uuid4().hex[:12]
+        trace_id        = _trace_id_var.get()
+        agent_name      = _agent_name_var.get()
+        parent_obs_id   = _parent_obs_var.get()
+        replayed_from   = _replayed_from_var.get()
 
-                except asyncio.TimeoutError:
-                    # Don't retry on timeout — likely indicates the upstream
-                    # request is genuinely stuck; retrying piles on.
-                    self._n_timeouts += 1
-                    raise
+        start_perf = time.perf_counter()
+        response: Any = None
+        err: Optional[BaseException] = None
 
-                except anthropic.RateLimitError as e:
-                    if attempt >= self.max_retries:
+        try:
+            async with self._semaphore:
+                for attempt in range(self.max_retries + 1):
+                    try:
+                        response = await asyncio.wait_for(
+                            self._sdk.messages.create(**kwargs),
+                            timeout=self.request_timeout_s,
+                        )
+                        self._n_requests += 1
+                        usage = getattr(response, "usage", None)
+                        if usage is not None:
+                            self._input_tokens  += getattr(usage, "input_tokens",  0) or 0
+                            self._output_tokens += getattr(usage, "output_tokens", 0) or 0
+                        break  # success — fall through to observation write
+
+                    except asyncio.TimeoutError:
+                        # Don't retry on timeout — likely indicates the upstream
+                        # request is genuinely stuck; retrying piles on.
+                        self._n_timeouts += 1
                         raise
-                    self._n_retries += 1
-                    await asyncio.sleep(self._backoff_for(attempt, e))
-                    continue
 
-                except anthropic.APIStatusError as e:
-                    # 529 (overloaded) and other server errors → retry
-                    status = getattr(e, "status_code", None)
-                    if status in (500, 502, 503, 504, 529):
+                    except anthropic.RateLimitError as e:
                         if attempt >= self.max_retries:
                             raise
                         self._n_retries += 1
                         await asyncio.sleep(self._backoff_for(attempt, e))
                         continue
-                    raise
+
+                    except anthropic.APIStatusError as e:
+                        # 529 (overloaded) and other server errors → retry
+                        status = getattr(e, "status_code", None)
+                        if status in (500, 502, 503, 504, 529):
+                            if attempt >= self.max_retries:
+                                raise
+                            self._n_retries += 1
+                            await asyncio.sleep(self._backoff_for(attempt, e))
+                            continue
+                        raise
+        except BaseException as e:
+            err = e
+            raise
+        finally:
+            if trace_id:  # observations are best-effort; only write when a trace is active
+                latency_ms = int((time.perf_counter() - start_perf) * 1000)
+                await _write_observation_safe(
+                    observation_id=observation_id,
+                    trace_id=trace_id,
+                    parent_observation_id=parent_obs_id,
+                    agent_name=agent_name,
+                    request_kwargs=kwargs,
+                    response=response,
+                    latency_ms=latency_ms,
+                    error=err,
+                    replayed_from_id=replayed_from,
+                )
+
+        return response
 
     def _backoff_for(self, attempt: int, error: Exception) -> float:
         """
@@ -228,6 +332,87 @@ class _MessagesProxy:
 
     async def create(self, **kwargs: Any):
         return await self._parent._messages_create(**kwargs)
+
+
+async def _write_observation_safe(
+    *,
+    observation_id: str,
+    trace_id: str,
+    parent_observation_id: Optional[str],
+    agent_name: Optional[str],
+    request_kwargs: dict,
+    response: Any,
+    latency_ms: int,
+    error: Optional[BaseException],
+    replayed_from_id: Optional[str] = None,
+) -> None:
+    """
+    Persist one `generation` observation. Imports database lazily because
+    `agents.llm_client` is imported before `database` in some call paths,
+    and observations should never crash the actual LLM call — any failure
+    inside this function is swallowed.
+
+    `request_kwargs` is the full dict the caller passed to messages.create
+    (system + messages + model + tools + max_tokens + temperature + ...).
+    Storing the whole kwargs blob makes `trace replay` trivial: load JSON,
+    edit, send back through the same wrapper.
+    """
+    try:
+        from database import save_observation  # late import (cycle-safe)
+
+        try:
+            messages_json = json.dumps(request_kwargs, default=str)
+        except Exception:
+            messages_json = json.dumps({"_unserializable": True, "model": request_kwargs.get("model")})
+
+        response_json: Optional[str] = None
+        input_tokens: Optional[int]  = None
+        output_tokens: Optional[int] = None
+        finish_reason: Optional[str] = None
+
+        if response is not None:
+            # Anthropic SDK is pydantic v2; model_dump_json() captures all fields.
+            try:
+                response_json = response.model_dump_json()
+            except Exception:
+                try:
+                    response_json = json.dumps(response.model_dump(), default=str)
+                except Exception:
+                    response_json = json.dumps({"_unserializable": True})
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                input_tokens  = getattr(usage, "input_tokens",  None)
+                output_tokens = getattr(usage, "output_tokens", None)
+            finish_reason = getattr(response, "stop_reason", None)
+
+        err_msg: Optional[str] = None
+        if error is not None:
+            err_msg = f"{type(error).__name__}: {error}"
+            # On failure we still record the call but flag the finish_reason.
+            if finish_reason is None:
+                finish_reason = "error"
+
+        await save_observation(
+            observation_id=observation_id,
+            trace_id=trace_id,
+            parent_observation_id=parent_observation_id,
+            type="generation",
+            agent_name=agent_name,
+            model=request_kwargs.get("model"),
+            provider="anthropic",
+            operation="chat",
+            messages_json=messages_json,
+            response_json=response_json,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            latency_ms=latency_ms,
+            finish_reason=finish_reason,
+            error_message=err_msg,
+            replayed_from_id=replayed_from_id,
+        )
+    except Exception:
+        # Observability must never break the actual call path. Swallow.
+        pass
 
 
 def format_usage_summary(usage: dict) -> str:

@@ -68,6 +68,42 @@ async def init_db():
             await db.execute("ALTER TABLE task_graphs ADD COLUMN contract_json TEXT")
         except Exception:
             pass  # column already exists
+
+        # Observability slice (post-P4): Langfuse-style observations table.
+        # One row per LLM call (and future: tool_call / span / event).
+        # Discriminator `type` lets one table cover all kinds; `parent_observation_id`
+        # gives a tree shape for `trace show`. Column names align with the
+        # OpenTelemetry GenAI semconv where they map, so an OTLP exporter
+        # later is rename-free. `replayed_from_id` links a replay back to
+        # its source generation (prompt-level replay only).
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS observations (
+                id                     TEXT PRIMARY KEY,
+                trace_id               TEXT NOT NULL,
+                parent_observation_id  TEXT,
+                type                   TEXT NOT NULL,
+                agent_name             TEXT,
+                model                  TEXT,
+                provider               TEXT,
+                operation              TEXT,
+                messages_json          TEXT,
+                response_json          TEXT,
+                input_tokens           INTEGER,
+                output_tokens          INTEGER,
+                latency_ms             INTEGER,
+                finish_reason          TEXT,
+                error_message          TEXT,
+                replayed_from_id       TEXT,
+                created_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_observations_trace ON observations(trace_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_observations_parent ON observations(parent_observation_id)"
+        )
+
         await db.commit()
 
 
@@ -325,6 +361,77 @@ async def list_graphs() -> list[dict]:
                FROM task_graphs ORDER BY created_at DESC"""
         ) as cursor:
             return [dict(r) for r in await cursor.fetchall()]
+
+
+# ---------- Observations CRUD (observability slice) ----------
+
+async def save_observation(
+    *,
+    observation_id: str,
+    trace_id: str,
+    type: str,
+    parent_observation_id: str | None = None,
+    agent_name: str | None = None,
+    model: str | None = None,
+    provider: str | None = "anthropic",
+    operation: str | None = "chat",
+    messages_json: str | None = None,
+    response_json: str | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    latency_ms: int | None = None,
+    finish_reason: str | None = None,
+    error_message: str | None = None,
+    replayed_from_id: str | None = None,
+) -> None:
+    """
+    Insert one observation row. Caller picks the id (so the wrapper can
+    return it to its caller for replay linking) and stamps the type. Most
+    fields are optional — error paths write rows with response_json=None
+    and finish_reason='error' so failed calls remain visible in trace show.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO observations
+                (id, trace_id, parent_observation_id, type, agent_name,
+                 model, provider, operation, messages_json, response_json,
+                 input_tokens, output_tokens, latency_ms, finish_reason,
+                 error_message, replayed_from_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                observation_id, trace_id, parent_observation_id, type, agent_name,
+                model, provider, operation, messages_json, response_json,
+                input_tokens, output_tokens, latency_ms, finish_reason,
+                error_message, replayed_from_id,
+            ),
+        )
+        await db.commit()
+
+
+async def get_observations_by_trace(trace_id: str) -> list[dict]:
+    """Return all observations for a trace, oldest first. `trace show` uses
+    this and builds the tree client-side via parent_observation_id."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM observations WHERE trace_id=? ORDER BY created_at",
+            (trace_id,),
+        ) as cursor:
+            return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_observation(observation_id: str) -> dict | None:
+    """Single-row fetch — used by `trace replay`."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM observations WHERE id=?",
+            (observation_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
 
 
 async def update_node_status(graph_id: str, node_id: str, new_status: str) -> bool:

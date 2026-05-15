@@ -19,7 +19,7 @@ chunk; for now the planner runs cold every time.
 import os
 import json
 from dotenv import load_dotenv
-from agents.llm_client import client    # P3: rate-limited HTTP wrapper
+from agents.llm_client import client, set_trace_context    # P3 wrapper + observability
 from memory.vector_store import query_relevant_plans, format_plans_for_prompt
 
 load_dotenv()
@@ -255,6 +255,7 @@ async def plan(
         past_plans_text=past_plans_text,
     )
 
+    set_trace_context(agent_name="Planner")
     response = await client.messages.create(
         model=MODEL,
         max_tokens=max_tokens,
@@ -577,6 +578,7 @@ async def synthesize_report(
     flat = _flatten_experts_for_synth(expert_outputs)
     prompt = _build_synth_prompt(requirement, flat)
 
+    set_trace_context(agent_name="Synthesizer")
     response = await client.messages.create(
         model=MODEL,
         max_tokens=max_tokens,

@@ -104,6 +104,8 @@ def _interactive_shell():
             if joined.startswith('"') and joined.endswith('"') and len(joined) >= 2:
                 joined = joined[1:-1]
             asyncio.run(_cmd_build(joined))
+        elif cmd == "trace":
+            asyncio.run(_cmd_trace(args))
         else:
             console.print(f"[red]Unknown command: {cmd}[/red]")
             _print_help()
@@ -120,6 +122,8 @@ def _print_help():
     table.add_row("build \"<requirement>\"",      "Break a natural-language requirement into a task graph")
     table.add_row("status",                       "Show all tasks and their current state")
     table.add_row("logs <task_id>",               "Show execution log for a task")
+    table.add_row("trace show <trace_id>",        "Render LLM trace tree (use --prompt to expand)")
+    table.add_row("trace replay <obs_id>",        "Re-run one captured generation with an edited prompt")
     table.add_row("exit",                         "Exit the shell")
     console.print(table)
 
@@ -217,6 +221,11 @@ async def _cmd_reflect(task_id: str = None):
 async def _cmd_build(requirement: str):
     from cli.build_cmd import cmd_build
     await cmd_build(requirement)
+
+
+async def _cmd_trace(args: list[str]):
+    from cli.trace_cmd import cmd_trace
+    await cmd_trace(args)
 
 
 async def _cmd_logs(task_id: str = None):

@@ -26,7 +26,7 @@ from database import init_db, save_graph
 from scanner.repo_scanner import load_profile
 from orchestrator.planner import plan, plan_with_experts, synthesize_report
 from memory.vector_store import add_plan, get_stats
-from agents.llm_client import client as llm_client, format_usage_summary
+from agents.llm_client import client as llm_client, format_usage_summary, set_trace_context
 from models import TaskNode, TaskGraph, Contract, Criterion
 
 
@@ -719,10 +719,17 @@ async def _cmd_build_inner(requirement: str) -> None:
         console.print("[red]Repo not scanned yet. Run: scan[/red]")
         return
 
+    # Observability: a build doesn't have a graph_id until approval, so use
+    # a one-off trace_id. Every LLM call inside this build (planner,
+    # experts, synthesizer) writes observations under this trace.
+    build_trace_id = f"build-{uuid.uuid4().hex[:8]}"
+    set_trace_context(trace_id=build_trace_id, agent_name="Orchestrator")
+
     console.print(Panel.fit(
         f"[bold]Build[/bold]: {requirement}",
         border_style="blue",
     ))
+    console.print(f"  [dim]trace_id: {build_trace_id}[/dim]")
 
     # ---------- Stage 1: plan_with_experts ----------
     with console.status("[bold blue]Running expert agents in parallel...[/bold blue]"):

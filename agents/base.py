@@ -4,7 +4,7 @@ import uuid
 import asyncio
 from abc import ABC, abstractmethod
 from dotenv import load_dotenv
-from agents.llm_client import client    # P3: rate-limited HTTP wrapper
+from agents.llm_client import client, set_trace_context    # P3 wrapper + observability slice
 from models import AgentFinding, TaskSpec
 
 load_dotenv()
@@ -33,6 +33,11 @@ class BaseAgent(ABC):
         prompt = self.build_prompt(task, diff, file_contents, repo_profile, memory)
         if owned_criteria:
             prompt = prompt + "\n\n" + self._contract_block(owned_criteria)
+
+        # Tag observation rows from this agent's LLM call with its own name.
+        # trace_id was set higher up by the orchestrator and propagates through
+        # the asyncio.gather contextvars copy — we only override agent_name.
+        set_trace_context(agent_name=self.name)
 
         try:
             response = await client.messages.create(
@@ -308,6 +313,9 @@ Rules:
         can decide whether to fail or proceed with partial perspectives.
         """
         prompt = self.build_requirement_prompt(requirement, repo_profile, memory or {})
+
+        # Same tagging rationale as review(): inherit trace_id, override agent_name.
+        set_trace_context(agent_name=self.name)
 
         try:
             response = await client.messages.create(

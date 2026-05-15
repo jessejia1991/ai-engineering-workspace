@@ -8,13 +8,14 @@ from database import (
     clear_unreviewed_findings,
 )
 from scanner.repo_scanner import load_profile, get_diff, get_changed_files, get_files_content
+from agents.llm_client import set_trace_context
 from orchestrator.agent_selector import select_agents
 from agents.security import SecurityAgent
 from agents.bug_finding import BugFindingAgent
 from agents.testing import TestingAgent
 from agents.uiux import UIUXAgent
 from agents.performance import PerformanceAgent
-from memory.vector_store import query_relevant_memory
+from memory.vector_store import query_relevant_memory, query_relevant_plans
 
 AGENT_REGISTRY = {
     "SecurityAgent":    SecurityAgent(),
@@ -333,6 +334,12 @@ async def run_review(
     if cleared:
         status(f"Cleared {cleared} stale finding(s) from a previous review")
     await update_task_status(task_id, "IN_PROGRESS")
+
+    # Observability: trace_id = task_id pins every LLM observation made
+    # during this review (selector + agents + retries) to one queryable
+    # timeline. Each agent's own review() overrides agent_name when its
+    # asyncio.Task starts.
+    set_trace_context(trace_id=task_id, agent_name="Orchestrator")
 
     # 6. Agent selection
     status("Selecting agents...")

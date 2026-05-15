@@ -1,7 +1,7 @@
 import os
 import json
 from dotenv import load_dotenv
-from agents.llm_client import client    # P3: rate-limited HTTP wrapper
+from agents.llm_client import client, set_trace_context    # P3 wrapper + observability
 from models import AgentSelection
 
 load_dotenv()
@@ -123,6 +123,7 @@ Return ONLY a JSON object in this exact format:
 """
 
     try:
+        set_trace_context(agent_name="AgentSelector")
         response = await client.messages.create(
             model=MODEL,
             max_tokens=500,

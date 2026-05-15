@@ -172,7 +172,7 @@ The plan in §4 addresses missing items either by building them or explicitly di
 
 ## 4. Work plan — May 14–18
 
-> **Cursor:** P1 wrap-up phase. All 4 priorities + P3 wrapper + scalability hardening landed 2026-05-14. Late-day real-PR testing on vaadin/hilla #3429 + #4533 surfaced 8 production gaps (see §16) all of which were fixed in code (retry tuning, default-branch detect, GitHub write safety + allowlist, agent_error logging, file grouping + dedup as failed-experiment record). Plan↔Review contract loop is end-to-end demoable. Remaining work: `requirements.txt` ✓, `README.md`, design doc Tradeoffs + Evaluation-Against-Brief sections (can be largely synthesized from §16). Push to origin/main is gated by user decision.
+> **Cursor:** P1 wrap-up phase. All 4 priorities + P3 wrapper + scalability hardening + observability slice (Langfuse-style `observations` table + SDK wrapper instrumentation + `trace show / replay` CLI) landed 2026-05-14. Late-day real-PR testing on vaadin/hilla #3429 + #4533 surfaced 8 production gaps (see §16) all of which were fixed in code (retry tuning, default-branch detect, GitHub write safety + allowlist, agent_error logging, file grouping + dedup as failed-experiment record). Plan↔Review contract loop is end-to-end demoable. Remaining work: `requirements.txt` ✓, observability slice ✓, `README.md`, design doc Tradeoffs + Evaluation-Against-Brief sections (can be largely synthesized from §16). Push to origin/main is gated by user decision.
 >
 > *Update this line as work progresses. Claude Code reads this on every "continue" request to find the next task.*
 
@@ -827,15 +827,46 @@ Borrowed patterns:
 
 ### 16.6 Observability TODO
 
-- [ ] Wrap `client.messages.create()` once at the SDK boundary to capture every prompt + response — closes the gap where prompts are built then discarded.
-- [ ] Migrate `execution_log` schema: add `trace_id` / `span_id` / `parent_span_id` / `kind`.
-- [ ] Add `llm_call` table for full prompt/response/usage capture (replaces the truncated 8K `_raw_response` field).
-- [ ] CLI `trace show <task_id>` — render `execution_log` as a tree via `parent_span_id`; expand LLM nodes inline.
-- [ ] CLI `trace replay <span_id> [--edit]` — only when `kind='llm'`. Load `messages_json` into `$EDITOR`, re-invoke client, diff against original `response_text`. Don't try to replay non-LLM spans (LangSmith and Weave both gave up on that).
-- [ ] Adopt OpenTelemetry GenAI attribute names — free future-proofing.
-- [ ] Add `synth_result` event to `execution_log` (P4 Chunk C's Synthesizer is currently a black box).
+- [x] Wrap `client.messages.create()` once at the SDK boundary to capture every prompt + response — done 2026-05-14 in `agents/llm_client.py:_messages_create`. Every call writes one `observations` row with full `request_kwargs` (system + messages + model + tools + temperature) + `response.model_dump_json()`. Observation write is best-effort + never blocks the call path.
+- [x] Schema migration — chose Langfuse-style instead of OTel-style. Single `observations` table with `type` discriminator (`generation | tool_call | span | event`) + self-referential `parent_observation_id` + `replayed_from_id`. Column names align with OTel GenAI semconv (`gen_ai.request.model` → `model`, `gen_ai.usage.input_tokens` → `input_tokens`, etc.) so an OTLP exporter is rename-free. Industry-survey rationale in 2026-05-14 research notes.
+- [x] Full prompt/response capture — `observations.messages_json` stores the entire request kwargs as JSON (replaces the 8K `_raw_response` truncation); `observations.response_json` stores the SDK's full `model_dump_json()`. Smoke-tested on real petclinic PR #1 review — 4 generations captured with full prompts visible via `trace show --prompt`.
+- [x] CLI `trace show <trace_id> [--prompt]` — done in `cli/trace_cmd.py`. Rich tree rendering by `parent_observation_id`; header summary panel with totals; `--prompt` expands messages + response inline (1500-char truncation per part).
+- [x] CLI `trace replay <observation_id>` — done. Refuses non-generation types. Renders source prompt + original response, reads new user message via inline stdin (multi-line terminated by `.`), sends through the wrapper with `replayed_from_id` set via contextvar, renders new response, prints the new observation id for chained replay. Replays nest as children of their source in the tree.
+- [x] Adopt OpenTelemetry GenAI attribute names — done. `provider='anthropic'`, `operation='chat'`, plus `model`, `input_tokens`, `output_tokens`, `finish_reason` already align. Forward-compatible with an OTLP exporter without column renames.
+- [ ] Add `synth_result` event to `execution_log` (P4 Chunk C's Synthesizer is currently a black box). *Partly covered now*: synth's LLM call is observed under `agent_name='Synthesizer'` in `observations`. The structured `expert_summaries → draft_criteria` payload is still not logged separately.
 - [ ] Persist `reflect` accept/reject events with timestamp + reason — currently SQLite-only via the `accepted` column, no audit trail in execution_log.
 - [ ] Cross-task `trace_id` — link a `build` task with subsequent `review` tasks that consume its contract. Closes the "trace_id = task_id, no cross-task linking" gap noted earlier.
+
+### 16.9 Observability slice landed 2026-05-14
+
+Implemented the four-item Phoenix/Langfuse-style slice from §16.6 (items 1-6 in the table above). Total new code: `cli/trace_cmd.py` (~390 LoC) + ~180 LoC across `agents/llm_client.py`, `database.py`, `agents/base.py`, `orchestrator/{runner.py, planner.py, agent_selector.py}`, `cli/{main.py, build_cmd.py}`.
+
+**Industry survey driving the design** (May 2026 research, condensed):
+
+| Question | Industry answer | Our choice |
+|---|---|---|
+| Trace schema | Langfuse: 1 obs table + `type` discriminator + `parent_observation_id`. LangSmith/Phoenix: pure OTel span tree. | Langfuse — product queries like "all generations in this run" stay trivial |
+| Replay scope | Universal: prompt-level only (LangSmith / Phoenix / Braintrust playgrounds). Full agent-run replay is a research problem (non-idempotent tools, sampling, wall-clock). | Prompt-level only. `replayed_from_id` link. Document the limitation. |
+| Wire format | OTel GenAI semconv attribute names — de-facto stable in 2026 even though spec is "experimental". | Adopt the naming; no OTLP exporter yet, but free future-proofing |
+| Payload storage | Serious tools = object storage by ref; small tools = inline JSON. | Inline JSON column — fine at our scale; trivial to move to filesystem later |
+| Trace context propagation | Anthropic Claude Code: `TRACEPARENT` through subprocess. LangSmith: thread-local. Phoenix: OTel contextvars. | Python contextvars (`set_trace_context`) — propagates across `await` and `asyncio.gather` automatically. |
+
+**End-to-end demo path** (verified 2026-05-14 on petclinic PR #1):
+
+```
+review --pr 1                                # writes 4 obs under TASK-PR1
+trace show TASK-PR1                          # tree: AgentSelector + 3 agents, 5525 in/1577 out, 33.5s
+trace show TASK-PR1 --prompt                 # expand full prompts inline
+trace replay obs-623cda5284c7                # edit SecurityAgent's last user msg, send, diff
+trace show TASK-PR1                          # replay nests as child of obs-623cda5284c7
+```
+
+**What's deliberately not done** (kept honest):
+- `trace replay --edit` with `$EDITOR` — user chose inline-stdin only to dodge editor-detection edge cases. Multi-line input terminated by `.` works in pipes and ttys both.
+- `synth_result` structured event — synthesizer's LLM call is captured under `agent_name='Synthesizer'` but the structured `{expert_summaries, draft_criteria}` payload still only lives in CLI output. Tracked under §16.6.
+- Cross-task `trace_id` linking — a `build`'s contract and the `review` consuming it use different trace_ids (`build-<uuid>` vs `TASK-PR<n>`). Listed in §16.6, design doc future work.
+- Object-storage payload backend — inline JSON is fine for current scale (largest call ≈ 25KB). Would migrate to `file:<hash>` references at ~1MB+ calls.
+- Bug fix piggybacked: `orchestrator/runner.py` was importing `query_relevant_plans` from `memory.vector_store` without importing it. Surfaced during the e2e smoke; fix is a single-line import.
 
 ### 16.7 Memory layer limitations (documented; left as design discussion)
 
