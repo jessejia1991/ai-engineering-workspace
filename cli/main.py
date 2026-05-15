@@ -13,7 +13,9 @@ load_dotenv()
 
 console = Console()
 
-REPO_PATH = os.environ.get("PETCLINIC_REPO_PATH", "")
+# REPO_PATH was previously a module-level constant; it's now read fresh
+# in _cmd_scan so the `init` wizard's mid-process .env update is picked up
+# without restart.
 
 
 def print_banner():
@@ -29,6 +31,19 @@ def print_banner():
 def cli(ctx):
     """AI Engineering Workspace — multi-agent code review system."""
     if ctx.invoked_subcommand is None:
+        # Auto-trigger the init wizard on first run. Threshold: no
+        # ANTHROPIC_API_KEY in env. Other fields are nice-to-have but
+        # nothing works without the key, so this is the right gate.
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            console.print(
+                "[yellow]No ANTHROPIC_API_KEY configured — running setup wizard.[/yellow]"
+            )
+            console.print(
+                "[dim]This runs once. Re-run later with the [bold]init[/bold] command.[/dim]\n"
+            )
+            asyncio.run(_cmd_init())
+            console.print()
+
         print_banner()
         console.print("[dim]Type 'help' for available commands, 'exit' to quit.[/dim]\n")
         _interactive_shell()
@@ -110,6 +125,8 @@ def _interactive_shell():
             asyncio.run(_cmd_repo(args))
         elif cmd == "memory":
             asyncio.run(_cmd_memory(args))
+        elif cmd == "init":
+            asyncio.run(_cmd_init())
         else:
             console.print(f"[red]Unknown command: {cmd}[/red]")
             _print_help()
@@ -135,6 +152,7 @@ def _print_help():
     table.add_row("memory stats [--repo X]",      "Memory counts per collection / per repo")
     table.add_row("memory prune [--dry-run]",     "LRU evict from memory (pinned + young protected)")
     table.add_row("memory compact",               "LLM-driven cluster merge of duplicate corrections")
+    table.add_row("init",                         "Re-run the setup wizard (keys, model, first repo)")
     table.add_row("exit",                         "Exit the shell")
     console.print(table)
 
@@ -143,13 +161,18 @@ async def _cmd_scan():
     from scanner.repo_scanner import scan
     from database import init_db, add_repo, set_active_repo, get_active_repo, get_repo
 
-    if not REPO_PATH:
-        console.print("[red]PETCLINIC_REPO_PATH not set in .env[/red]")
+    # Read fresh so post-init .env updates take effect without restart.
+    repo_path = os.environ.get("PETCLINIC_REPO_PATH", "")
+    if not repo_path:
+        console.print(
+            "[red]PETCLINIC_REPO_PATH not set in .env[/red] "
+            "[dim]— run [bold]init[/bold] or edit .env.[/dim]"
+        )
         return
 
     with console.status("[bold blue]Scanning repository...[/bold blue]"):
         try:
-            profile = scan(REPO_PATH)
+            profile = scan(repo_path)
         except FileNotFoundError as e:
             console.print(f"[red]{e}[/red]")
             return
@@ -160,7 +183,7 @@ async def _cmd_scan():
     # repo — second-scan of a different path doesn't silently switch you.
     await init_db()
     scanned_id = profile["repo_id"]
-    await add_repo(scanned_id, profile["repo_path"], display_name=scanned_id)
+    await add_repo(scanned_id, repo_path, display_name=scanned_id)
     active = await get_active_repo()
     if active is None:
         await set_active_repo(scanned_id)
@@ -268,6 +291,11 @@ async def _cmd_repo(args: list[str]):
 async def _cmd_memory(args: list[str]):
     from cli.memory_cmd import cmd_memory
     await cmd_memory(args)
+
+
+async def _cmd_init():
+    from cli.init_cmd import cmd_init
+    await cmd_init()
 
 
 async def _cmd_logs(task_id: str = None):

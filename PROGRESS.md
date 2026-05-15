@@ -89,8 +89,12 @@ ai-engineering-workspace/
 │   └── uiux.py                  ( 87)
 ├── cli/
 │   ├── build_cmd.py             (885)  P2/P4 build pipeline + Architect Report UX + Contract editing
-│   ├── main.py                  (315)  Interactive shell + dispatch
-│   ├── reflect_cmd.py           (192)  Human triage UI + correction write-back
+│   ├── init_cmd.py              (290)  5-step setup wizard (keys, model, first repo); auto-triggered on missing key
+│   ├── main.py                  (335)  Interactive shell + dispatch + first-run init auto-trigger
+│   ├── memory_cmd.py            (190)  `memory {stats,prune,compact}` — maintenance over the 3 collections
+│   ├── memory_compact.py        (250)  LLM-driven cluster-merge of corrections (used by `memory compact`)
+│   ├── reflect_cmd.py           (210)  Human triage UI + correction write-back + pin (`p+`)
+│   ├── repo_cmd.py              (190)  `repo {list,add,use,remove}` — registry-side entity management
 │   ├── review_cmd.py            (316)  Run a review on a PR + GitHub post (allowlist-gated)
 │   └── trace_cmd.py             (435)  `trace show` / `trace replay` observability CLI
 ├── database.py                  (455)  aiosqlite schema + helpers (tasks · findings · exec_log · graphs · observations)
@@ -187,7 +191,7 @@ The individual files have been smoke-tested in prior conversations, but **end-to
 | Scalability | ⚠ partial — HTTP wrapper enforces session-wide concurrency cap + token budget. File grouping experiment failed (see §16.3); roadmap of mitigations in §16.4 |
 | Observability | ✓ execution_log + observations table (Langfuse-style) + `trace show / replay` (see §16.5 + §16.9) |
 | Safety | ✓ GitHub-write two-gate (allowlist + opt-in flag) · no-write default · explicit blocked-by-allowlist message |
-| Developer experience | ✓ Rich-rendered shell · `LLM usage` printed every command · trace_id printed for `build` |
+| Developer experience | ✓ Rich-rendered shell · auto-triggered `init` wizard on first run · `LLM usage` printed every command · trace_id printed for `build` |
 
 **Bonus signals from the brief:**
 
@@ -215,7 +219,7 @@ The plan in §4 addresses missing items either by building them or explicitly di
 
 ## 4. Work plan — May 14–18
 
-> **Cursor:** P1 wrap-up phase. All 4 priorities + P3 wrapper + scalability hardening + observability slice + memory slice (repo-scoped retrieval + LRU prune + LLM compaction agent + `repo` / `memory` CLI surface) landed 2026-05-14/15. PROGRESS.md §16.6 + §16.7 items mostly ticked; per-engineer/team scope + memory freshness hint remain as design-doc future work. Plan↔Review contract loop is end-to-end demoable. Remaining work: `requirements.txt` ✓, observability slice ✓, memory slice ✓, `README.md`, design doc Tradeoffs + Evaluation-Against-Brief sections (can be largely synthesized from §16). Push to origin/main is gated by user decision.
+> **Cursor:** P1 wrap-up phase. All 4 priorities + P3 wrapper + scalability hardening + observability slice + memory slice + `init` wizard (5-step setup with key verification + auto-trigger on missing `ANTHROPIC_API_KEY`) landed 2026-05-14/15. PROGRESS.md §16.6 + §16.7 items mostly ticked. Plan↔Review contract loop is end-to-end demoable. Remaining work: `README.md` (now substantially smaller since `init` handles the quickstart step) + design doc Tradeoffs + Evaluation-Against-Brief sections. Push to origin/main is gated by user decision.
 >
 > *Update this line as work progresses. Claude Code reads this on every "continue" request to find the next task.*
 
@@ -818,18 +822,24 @@ than through `execution_log`.
 ```bash
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # edit: ANTHROPIC_API_KEY, GITHUB_TOKEN, GITHUB_REPO, PETCLINIC_REPO_PATH
-# Optional for GitHub posting demo (off by default for safety; see §16.2):
-#   REVIEW_ALLOWED_REPOS=jessejia1991/spring-petclinic-reactjs
-#   REVIEW_POST_COMMENTS=true
-python -m cli.main     # interactive shell
+python -m cli.main     # auto-triggers `init` wizard on first run
 ```
+
+The `init` wizard asks for `ANTHROPIC_API_KEY` (required, hidden), model
+(Sonnet 4.6 / Opus 4.7), optional `GITHUB_TOKEN` + `GITHUB_REPO`, and the
+first repo path. Writes `.env` atomically (preserves any unmanaged keys
++ comments), verifies the Anthropic key with a tiny test call, scans +
+auto-registers the first repo. Re-run `init` any time to switch model
+or keys; advanced settings (`ANTHROPIC_MAX_CONCURRENT`,
+`REVIEW_ALLOWED_REPOS`, `REVIEW_POST_COMMENTS`, `ANTHROPIC_TOKEN_BUDGET`)
+live in `.env` for manual editing — see `.env.example`.
 
 Shell commands:
 
 | Command | Purpose |
 |---|---|
-| `scan` | Build repo profile (P1) |
+| `init` | Re-run the setup wizard (keys, model, first repo) — auto-triggered if `ANTHROPIC_API_KEY` is unset |
+| `scan` | Build repo profile (P1); auto-registers + activates the repo if none is active |
 | `review --pr N [--branch X] [--graph GRAPH-xyz \| --no-graph] [--post \| --no-post]` | Multi-agent review of a PR, with optional contract auto-match (P1 + P4) |
 | `reflect [TASK-ID]` | Human triage of pending findings (P1) |
 | `logs [TASK-ID]` | Execution log timeline (P1) |
