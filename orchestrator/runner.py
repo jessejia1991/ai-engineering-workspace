@@ -221,6 +221,7 @@ def _should_group(file_contents: dict[str, str]) -> bool:
 async def find_graph_for_pr(
     pr_description: str,
     min_similarity: float = 0.4,
+    repo_id: str | None = None,
 ) -> dict | None:
     """
     Semantic auto-match: scan planning_memory for an approved graph
@@ -234,7 +235,7 @@ async def find_graph_for_pr(
     from database import load_graph
     if not pr_description or not pr_description.strip():
         return None
-    hits = query_relevant_plans(pr_description, top_k=3)
+    hits = query_relevant_plans(pr_description, top_k=3, repo_id=repo_id)
     if not hits:
         return None
     top = hits[0]
@@ -257,6 +258,7 @@ async def run_review(
     pr_description: str = "",
     auto_match: bool = True,
     on_status=None,
+    repo_id: str | None = None,
 ) -> tuple[list[AgentFinding], RiskReport]:
 
     def status(msg):
@@ -302,7 +304,7 @@ async def run_review(
             status(f"Warning: --graph {graph_id} not found or has no contract; "
                    f"running generic review")
     elif auto_match and pr_description:
-        candidate = await find_graph_for_pr(pr_description)
+        candidate = await find_graph_for_pr(pr_description, repo_id=repo_id)
         if candidate is None:
             status("No matching graph in planning_memory — generic review")
         elif candidate.get("_ambiguous"):
@@ -327,6 +329,7 @@ async def run_review(
         affected_files=changed_files,
         pr_url=f"https://github.com/{repo_profile.get('repo_id', '')}/pull/{pr_number}",
         branch=branch,
+        repo_id=repo_id,
     )
 
     await create_task(task_id, "review", task.model_dump())
@@ -400,7 +403,7 @@ async def run_review(
     query_text = (diff[:300] if diff else "") + " ".join(changed_files)
 
     memories = [
-        query_relevant_memory(agent.name, query_text)
+        query_relevant_memory(agent.name, query_text, repo_id=repo_id)
         for agent in agents_to_run
     ]
 

@@ -163,12 +163,25 @@ async def _cmd_review_inner(pr_number: int, branch: str = None, *,
                             post_decision: bool | None = None):
     from orchestrator.runner import run_review
     from github_client import post_review_comments, get_pr_description
-    from database import get_agent_reasoning
+    from database import get_agent_reasoning, init_db, get_active_repo
+
+    # Memory slice guard: a review against no repo is meaningless — there's
+    # no codebase to scope memory to. Block at entry with an actionable hint.
+    await init_db()
+    active = await get_active_repo()
+    if not active:
+        console.print(
+            "[red]No active repo set.[/red] Run [bold]repo add <path>[/bold] "
+            "then [bold]repo use <id>[/bold] before reviewing. "
+            "[dim]Or just run [bold]scan[/bold] — it auto-registers + activates.[/dim]"
+        )
+        return
 
     console.print()
     console.print(
         f"[bold blue]Reviewing PR #{pr_number}[/bold blue]" +
-        (f" [dim](branch: {branch})[/dim]" if branch else "")
+        (f" [dim](branch: {branch})[/dim]" if branch else "") +
+        f"\n[dim]repo: {active['id']}[/dim]"
     )
     console.print()
 
@@ -194,6 +207,7 @@ async def _cmd_review_inner(pr_number: int, branch: str = None, *,
             pr_description=pr_description,
             auto_match=auto_match,
             on_status=on_status,
+            repo_id=active["id"],
         )
     except RuntimeError as e:
         console.print(f"\n[red]Error: {e}[/red]")

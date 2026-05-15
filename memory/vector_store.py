@@ -1,6 +1,27 @@
+"""
+ChromaDB-backed semantic memory, repo-scoped.
+
+Three collections:
+  - findings_memory     per-agent: which past findings did humans accept/reject
+  - corrections_memory  cross-agent: explicit "don't repeat this mistake" notes
+  - planning_memory     repo-wide: requirement → final node mix + user edits
+
+Every entry carries:
+  - repo_id           the repo it was learned on (required)
+  - last_accessed_at  bumped on every successful retrieval (LRU signal)
+  - pinned            bool — protects against `memory prune`
+
+Retrieval is two-phase:
+  Phase 1: where={repo_id: active}        → tagged origin="own"
+  Phase 2: where={repo_id: {"$ne": active}} → tagged origin="cross"
+fills to top_k. Cross-repo hits exist because some engineering lessons
+("trivial getter/setter — skip unit tests") generalize across projects.
+The own/cross marker is preserved into `format_memory_for_prompt` so the
+LLM can weight the two pools differently.
+"""
+
 import os
 import math
-import json
 import threading
 import chromadb
 from datetime import datetime
@@ -73,46 +94,57 @@ def get_planning_collection():
     return _planning_collection
 
 
-def add_finding(finding_id: str, finding: dict, accepted: bool):
-    """
-    Store a finding in ChromaDB after human accept/reject.
-    The document text is what gets embedded for semantic search.
-    """
+# ===================================================================
+# Add — every entry is tagged with a repo_id + lifecycle metadata.
+# ===================================================================
+
+def _now_ts() -> float:
+    return datetime.now().timestamp()
+
+
+def add_finding(finding_id: str, finding: dict, accepted: bool, repo_id: str):
+    """Store a finding after human accept/reject. repo_id is required —
+    no global scope at write time; cross-repo retrieval happens at query
+    time via the phase-2 fallback."""
     collection = get_findings_collection()
-
     document = f"{finding.get('title', '')}. {finding.get('detail', '')}. {finding.get('suggestion', '')}"
-
+    now = _now_ts()
     collection.add(
         ids=[finding_id],
         documents=[document],
         metadatas=[{
-            "agent":        finding.get("agent", ""),
-            "severity":     finding.get("severity", "low"),
-            "category":     finding.get("category", ""),
-            "accepted":     str(accepted).lower(),
-            "file":         finding.get("file", "") or "",
-            "task_id":      finding.get("task_id", ""),
-            "timestamp":    datetime.now().timestamp(),
+            "repo_id":          repo_id,
+            "agent":            finding.get("agent", ""),
+            "severity":         finding.get("severity", "low"),
+            "category":         finding.get("category", ""),
+            "accepted":         str(accepted).lower(),
+            "file":             finding.get("file", "") or "",
+            "task_id":          finding.get("task_id", ""),
+            "timestamp":        now,
+            "last_accessed_at": now,
+            "pinned":           False,
         }]
     )
 
 
 def add_correction(correction_id: str, note: str, example: str,
-                   correction_type: str):
-    """
-    Store a correction (LLM misunderstanding) in ChromaDB.
-    Triggered when human rejects a finding with a reason.
-    """
+                   correction_type: str, repo_id: str,
+                   pinned: bool = False):
+    """Store a correction (LLM misunderstanding). repo_id is required.
+    `pinned=True` protects against `memory prune` — used when the user
+    flags a correction as "must not be evicted" during reflect."""
     collection = get_corrections_collection()
-
     document = f"{note}. Example: {example}"
-
+    now = _now_ts()
     collection.add(
         ids=[correction_id],
         documents=[document],
         metadatas=[{
-            "type":      correction_type,
-            "timestamp": datetime.now().timestamp(),
+            "repo_id":          repo_id,
+            "type":             correction_type,
+            "timestamp":        now,
+            "last_accessed_at": now,
+            "pinned":           bool(pinned),
         }]
     )
 
@@ -126,15 +158,10 @@ def add_plan(
     node_types: list[str],
     edits: list[str],
     approved: bool,
+    repo_id: str,
 ):
-    """
-    Record an approved `build` invocation for future planner runs to
-    retrieve. The document text is what gets embedded — make it rich
-    enough that "add notes to Pet" can semantically hit "add notes to
-    Visit" without exact-string overlap.
-    """
+    """Record an approved `build` invocation. repo_id is required."""
     collection = get_planning_collection()
-
     parts = [f"Requirement: {requirement}"]
     if needed_clarify and clarify_qa:
         parts.append(f"Clarify Q&A: {clarify_qa}")
@@ -144,12 +171,12 @@ def add_plan(
     else:
         parts.append("User edits: none")
     document = "\n".join(parts)
-
-    # ChromaDB metadata values must be primitives — flatten lists with commas.
+    now = _now_ts()
     collection.add(
         ids=[plan_id],
         documents=[document],
         metadatas=[{
+            "repo_id":         repo_id,
             "requirement":     requirement[:500],
             "needed_clarify":  bool(needed_clarify),
             "node_count":      int(node_count),
@@ -157,63 +184,161 @@ def add_plan(
             "edits_count":     len(edits),
             "edits_summary":   "; ".join(edits)[:500],
             "approved":        bool(approved),
-            "timestamp":       datetime.now().timestamp(),
+            "timestamp":       now,
+            "last_accessed_at": now,
+            "pinned":          False,
         }]
     )
 
 
-def query_relevant_plans(query_text: str, top_k: int = 3) -> list[dict]:
+# ===================================================================
+# Two-phase repo-scoped retrieval.
+# ===================================================================
+
+def _merge_where(base_where: dict | None, extra: dict) -> dict:
+    """ChromaDB requires explicit `$and` when combining filters."""
+    if not base_where:
+        return extra
+    return {"$and": [base_where, extra]}
+
+
+def _two_phase_query(
+    collection,
+    query_text: str,
+    top_k: int,
+    repo_id: str | None,
+    base_where: dict | None = None,
+) -> list[dict]:
     """
-    Semantic search for prior approved builds similar to the current
-    requirement. Returns top-K by similarity with time decay applied.
-    Empty list on first call (planning_memory empty).
+    Phase 1: own-repo (`repo_id == active`). Tagged origin='own'.
+    Phase 2: cross-repo fallback if phase 1 didn't fill top_k. Tagged origin='cross'.
+    When repo_id is None (shouldn't happen in normal flow — guards block before
+    here — but defensive for memory tools that operate outside a session),
+    just runs a single pass with no repo filter.
     """
-    collection = get_planning_collection()
     try:
         total = collection.count()
-        if total == 0:
-            return []
-        raw = collection.query(
-            query_texts=[query_text],
-            n_results=min(top_k, total),
-        )
-        return _apply_time_decay(raw)
     except Exception:
         return []
+    if total == 0:
+        return []
+
+    out: list[dict] = []
+
+    if repo_id is None:
+        try:
+            raw = collection.query(
+                query_texts=[query_text],
+                n_results=min(top_k, total),
+                where=base_where if base_where else None,
+            )
+            out.extend(_apply_time_decay(raw, origin="unscoped"))
+        except Exception:
+            return []
+        _bump_access(collection, [r["id"] for r in out])
+        return out
+
+    # Phase 1: own-repo
+    try:
+        own_where = _merge_where(base_where, {"repo_id": repo_id})
+        raw_own = collection.query(
+            query_texts=[query_text],
+            n_results=min(top_k, total),
+            where=own_where,
+        )
+        out.extend(_apply_time_decay(raw_own, origin="own"))
+    except Exception:
+        pass
+
+    # Phase 2: cross-repo fallback (only fill remaining slots)
+    remaining = top_k - len(out)
+    if remaining > 0:
+        try:
+            cross_where = _merge_where(base_where, {"repo_id": {"$ne": repo_id}})
+            raw_cross = collection.query(
+                query_texts=[query_text],
+                n_results=min(remaining, total),
+                where=cross_where,
+            )
+            out.extend(_apply_time_decay(raw_cross, origin="cross"))
+        except Exception:
+            pass
+
+    # Bump access time on everything we returned. Best-effort — failure
+    # never blocks the actual retrieval result.
+    _bump_access(collection, [r["id"] for r in out])
+    return out
 
 
-def format_plans_for_prompt(plans: list[dict]) -> str:
-    """
-    Render past-build hits as a compact prompt-friendly block. Returns
-    empty string when there are no hits, so callers can guard with `if`.
-    """
-    if not plans:
-        return ""
-    lines = ["## Past similar builds in this repo"]
-    for p in plans[:3]:
-        meta  = p.get("metadata", {}) or {}
-        req   = meta.get("requirement", "")[:160]
-        nc    = meta.get("node_count", "?")
-        nt    = meta.get("node_types", "")
-        clar  = "clarified first" if meta.get("needed_clarify") else "no clarify"
-        edits = meta.get("edits_summary", "")
-        edits_part = f"; user edits: {edits[:160]}" if edits else ""
-        lines.append(f"- \"{req}\" → {clar}; {nc} nodes ({nt}){edits_part}")
-    lines.append(
-        "\nWhen the current requirement is similar to a past build, follow "
-        "the same node mix — especially edits the user made — unless there "
-        "is a clear reason not to."
+def _bump_access(collection, ids: list[str]) -> None:
+    """Update last_accessed_at on retrieved items. ChromaDB's update merges
+    metadata, so we only need to send the changed key. Swallow any
+    exception — observability/LRU is best-effort."""
+    if not ids:
+        return
+    now = _now_ts()
+    try:
+        collection.update(
+            ids=ids,
+            metadatas=[{"last_accessed_at": now} for _ in ids],
+        )
+    except Exception:
+        pass
+
+
+def query_relevant_plans(query_text: str, top_k: int = 3,
+                         repo_id: str | None = None) -> list[dict]:
+    """Semantic search over planning_memory, repo-scoped + cross-repo fallback."""
+    return _two_phase_query(
+        get_planning_collection(),
+        query_text=query_text,
+        top_k=top_k,
+        repo_id=repo_id,
     )
-    return "\n".join(lines)
 
 
-def _apply_time_decay(results: dict, decay_rate: float = 0.05) -> list[dict]:
+def query_relevant_memory(
+    agent_name: str,
+    query_text: str,
+    top_k_findings: int = 5,
+    top_k_corrections: int = 3,
+    repo_id: str | None = None,
+) -> dict:
+    """
+    Returns relevant findings (filtered to this agent) + corrections, each
+    tagged with origin='own'/'cross'/'unscoped' for downstream rendering.
+    """
+    findings = _two_phase_query(
+        get_findings_collection(),
+        query_text=query_text,
+        top_k=top_k_findings,
+        repo_id=repo_id,
+        base_where={"agent": agent_name},
+    )
+    corrections = _two_phase_query(
+        get_corrections_collection(),
+        query_text=query_text,
+        top_k=top_k_corrections,
+        repo_id=repo_id,
+    )
+    return {
+        "relevant_findings":    findings,
+        "relevant_corrections": corrections,
+        "findings_count":       len(findings),
+        "corrections_count":    len(corrections),
+    }
+
+
+def _apply_time_decay(results: dict, decay_rate: float = 0.05,
+                      origin: str = "own") -> list[dict]:
     """
     Apply time decay to ChromaDB results.
     Older entries get lower effective scores.
     Nothing is deleted — decay makes old entries rank lower naturally.
+    Items are tagged with `origin` so downstream rendering can show
+    whether a hit came from the active repo or the cross-repo pool.
     """
-    now = datetime.now().timestamp()
+    now = _now_ts()
     scored = []
 
     ids        = results.get("ids", [[]])[0]
@@ -237,64 +362,29 @@ def _apply_time_decay(results: dict, decay_rate: float = 0.05) -> list[dict]:
             "document":   documents[i] if i < len(documents) else "",
             "metadata":   metadata,
             "similarity": similarity,
+            "origin":     origin,
         })
 
     return sorted(scored, key=lambda x: x["similarity"], reverse=True)
 
 
-def query_relevant_memory(
-    agent_name: str,
-    query_text: str,
-    top_k_findings: int = 5,
-    top_k_corrections: int = 3,
-) -> dict:
-    """
-    Semantic search for relevant memory given current diff/context.
-    Returns top-K findings and corrections by semantic similarity + time decay.
-    """
-    findings_col    = get_findings_collection()
-    corrections_col = get_corrections_collection()
+# ===================================================================
+# Prompt formatting — preserves origin markers.
+# ===================================================================
 
-    # Query findings for this specific agent
-    try:
-        findings_count = findings_col.count()
-        if findings_count > 0:
-            raw_findings = findings_col.query(
-                query_texts=[query_text],
-                n_results=min(top_k_findings, findings_count),
-                where={"agent": agent_name}
-            )
-            relevant_findings = _apply_time_decay(raw_findings)
-        else:
-            relevant_findings = []
-    except Exception:
-        relevant_findings = []
-
-    # Query corrections (all agents — corrections are repo-wide)
-    try:
-        corrections_count = corrections_col.count()
-        if corrections_count > 0:
-            raw_corrections = corrections_col.query(
-                query_texts=[query_text],
-                n_results=min(top_k_corrections, corrections_count),
-            )
-            relevant_corrections = _apply_time_decay(raw_corrections)
-        else:
-            relevant_corrections = []
-    except Exception:
-        relevant_corrections = []
-
-    return {
-        "relevant_findings":    relevant_findings,
-        "relevant_corrections": relevant_corrections,
-        "findings_count":       len(relevant_findings),
-        "corrections_count":    len(relevant_corrections),
-    }
+def _origin_marker(item: dict) -> str:
+    o = item.get("origin", "own")
+    if o == "own":
+        return "[own-repo]"
+    if o == "cross":
+        return "[cross-repo]"
+    return ""
 
 
 def format_memory_for_prompt(memory: dict) -> str:
     """
     Format retrieved memory into a compact string for prompt injection.
+    `[own-repo]` / `[cross-repo]` markers let the LLM weight pools.
     Stays within ~800 token budget.
     """
     lines = []
@@ -303,40 +393,162 @@ def format_memory_for_prompt(memory: dict) -> str:
     corrections = memory.get("relevant_corrections", [])
 
     if findings:
-        lines.append("Relevant findings from past reviews on this repo:")
+        lines.append("Relevant findings from past reviews:")
         for f in findings[:5]:
             meta     = f.get("metadata", {})
             accepted = meta.get("accepted", "unknown")
             label    = "ACCEPTED" if accepted == "true" else "REJECTED"
-            lines.append(f"  [{label}] {f['document'][:200]}")
+            marker   = _origin_marker(f)
+            lines.append(f"  {marker} [{label}] {f['document'][:200]}")
         lines.append("")
 
     if corrections:
-        lines.append("Known corrections about this codebase (do not repeat these mistakes):")
+        lines.append("Known corrections (do not repeat these mistakes):")
         for c in corrections[:3]:
-            lines.append(f"  - {c['document'][:200]}")
+            marker = _origin_marker(c)
+            lines.append(f"  {marker} {c['document'][:200]}")
         lines.append("")
 
     if not lines:
         return "No relevant memory yet."
 
+    lines.append(
+        "[own-repo] = learned on this codebase; [cross-repo] = general "
+        "engineering lesson from another project. Weight own-repo evidence "
+        "more heavily when they conflict."
+    )
     return "\n".join(lines)
 
 
-def get_stats() -> dict:
-    """Return basic stats about what's stored in memory."""
+def format_plans_for_prompt(plans: list[dict]) -> str:
+    """Render past-build hits as a compact prompt-friendly block."""
+    if not plans:
+        return ""
+    lines = ["## Past similar builds"]
+    for p in plans[:3]:
+        meta  = p.get("metadata", {}) or {}
+        req   = meta.get("requirement", "")[:160]
+        nc    = meta.get("node_count", "?")
+        nt    = meta.get("node_types", "")
+        clar  = "clarified first" if meta.get("needed_clarify") else "no clarify"
+        edits = meta.get("edits_summary", "")
+        edits_part = f"; user edits: {edits[:160]}" if edits else ""
+        marker = _origin_marker(p)
+        lines.append(f"- {marker} \"{req}\" → {clar}; {nc} nodes ({nt}){edits_part}")
+    lines.append(
+        "\nWhen the current requirement is similar to a past build, follow "
+        "the same node mix — especially edits the user made — unless there "
+        "is a clear reason not to. [own-repo] history outranks [cross-repo]."
+    )
+    return "\n".join(lines)
+
+
+# ===================================================================
+# Stats — optionally per-repo. Used by `memory stats` CLI.
+# ===================================================================
+
+def get_stats(repo_id: str | None = None) -> dict:
+    """Counts per collection. If repo_id is given, restrict to that repo."""
+    def _count(coll) -> int:
+        try:
+            if repo_id is None:
+                return coll.count()
+            # No native count-by-where in chromadb; use get() with ids only.
+            res = coll.get(where={"repo_id": repo_id}, include=[])
+            return len(res.get("ids", []))
+        except Exception:
+            return 0
+
+    return {
+        "findings_in_memory":    _count(get_findings_collection()),
+        "corrections_in_memory": _count(get_corrections_collection()),
+        "planning_in_memory":    _count(get_planning_collection()),
+        "repo_id":               repo_id,
+    }
+
+
+def get_stats_by_repo() -> dict[str, dict]:
+    """Group counts by repo_id across all 3 collections. Used by `memory stats`
+    when no --repo arg is passed, and by `repo list` to show entry counts."""
+    by_repo: dict[str, dict] = {}
+
+    def _accumulate(coll, key: str) -> None:
+        try:
+            res = coll.get(include=["metadatas"])
+            for m in res.get("metadatas", []) or []:
+                rid = (m or {}).get("repo_id") or "_unknown"
+                by_repo.setdefault(rid, {
+                    "findings_in_memory":    0,
+                    "corrections_in_memory": 0,
+                    "planning_in_memory":    0,
+                })
+                by_repo[rid][key] += 1
+        except Exception:
+            pass
+
+    _accumulate(get_findings_collection(),    "findings_in_memory")
+    _accumulate(get_corrections_collection(), "corrections_in_memory")
+    _accumulate(get_planning_collection(),    "planning_in_memory")
+    return by_repo
+
+
+# ===================================================================
+# Maintenance helpers — used by `memory prune` and `memory compact`.
+# ===================================================================
+
+def list_entries(collection_name: str, repo_id: str | None = None) -> list[dict]:
+    """Return all entries (id + document + metadata) from one collection,
+    optionally filtered to a repo. Used by prune / compact / stats — not for
+    hot retrieval paths."""
+    coll = {
+        "findings":     get_findings_collection(),
+        "corrections":  get_corrections_collection(),
+        "planning":     get_planning_collection(),
+    }.get(collection_name)
+    if coll is None:
+        raise ValueError(f"unknown collection: {collection_name}")
+
     try:
-        findings_count    = get_findings_collection().count()
-        corrections_count = get_corrections_collection().count()
-        planning_count    = get_planning_collection().count()
-        return {
-            "findings_in_memory":    findings_count,
-            "corrections_in_memory": corrections_count,
-            "planning_in_memory":    planning_count,
-        }
+        where = {"repo_id": repo_id} if repo_id else None
+        res = coll.get(where=where, include=["documents", "metadatas"])
     except Exception:
-        return {
-            "findings_in_memory":    0,
-            "corrections_in_memory": 0,
-            "planning_in_memory":    0,
-        }
+        return []
+
+    out = []
+    for i, eid in enumerate(res.get("ids", []) or []):
+        out.append({
+            "id":       eid,
+            "document": (res.get("documents") or [None])[i] if i < len(res.get("documents") or []) else "",
+            "metadata": (res.get("metadatas") or [None])[i] if i < len(res.get("metadatas") or []) else {},
+        })
+    return out
+
+
+def delete_entries(collection_name: str, ids: list[str]) -> int:
+    """Delete by id. Used by prune (LRU eviction) and compact (cluster
+    consolidation). Returns count deleted."""
+    if not ids:
+        return 0
+    coll = {
+        "findings":     get_findings_collection(),
+        "corrections":  get_corrections_collection(),
+        "planning":     get_planning_collection(),
+    }.get(collection_name)
+    if coll is None:
+        raise ValueError(f"unknown collection: {collection_name}")
+    try:
+        coll.delete(ids=ids)
+        return len(ids)
+    except Exception:
+        return 0
+
+
+def delete_repo_entries(repo_id: str) -> dict[str, int]:
+    """Wipe everything tagged with this repo_id across all 3 collections.
+    Used by `repo remove` when the user opts to purge cached memory."""
+    counts = {}
+    for name in ("findings", "corrections", "planning"):
+        entries = list_entries(name, repo_id=repo_id)
+        ids = [e["id"] for e in entries]
+        counts[name] = delete_entries(name, ids)
+    return counts

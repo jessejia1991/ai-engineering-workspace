@@ -223,6 +223,7 @@ async def plan(
     clarify_history: str = "",
     max_tokens: int = 4000,
     use_planning_memory: bool = True,
+    repo_id: str | None = None,
 ) -> dict:
     """
     Run one planner invocation. Returns a validated dict per _validate_result.
@@ -245,7 +246,7 @@ async def plan(
     # 4th-layer memory injection: pull semantically-similar past builds so
     # the planner can skip redundant clarify rounds and follow the user's
     # established decomposition style.
-    past_plans = query_relevant_plans(requirement, top_k=3) if use_planning_memory else []
+    past_plans = query_relevant_plans(requirement, top_k=3, repo_id=repo_id) if use_planning_memory else []
     past_plans_text = format_plans_for_prompt(past_plans)
 
     prompt = _build_prompt(

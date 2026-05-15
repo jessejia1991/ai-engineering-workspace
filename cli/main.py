@@ -106,6 +106,10 @@ def _interactive_shell():
             asyncio.run(_cmd_build(joined))
         elif cmd == "trace":
             asyncio.run(_cmd_trace(args))
+        elif cmd == "repo":
+            asyncio.run(_cmd_repo(args))
+        elif cmd == "memory":
+            asyncio.run(_cmd_memory(args))
         else:
             console.print(f"[red]Unknown command: {cmd}[/red]")
             _print_help()
@@ -124,12 +128,20 @@ def _print_help():
     table.add_row("logs <task_id>",               "Show execution log for a task")
     table.add_row("trace show <trace_id>",        "Render LLM trace tree (use --prompt to expand)")
     table.add_row("trace replay <obs_id>",        "Re-run one captured generation with an edited prompt")
+    table.add_row("repo list",                    "List registered repos (active marked)")
+    table.add_row("repo add <path> [--use]",      "Register a repo for scoped memory")
+    table.add_row("repo use <id>",                "Switch active repo")
+    table.add_row("repo remove <id>",             "Unregister (with optional purge of cached memory)")
+    table.add_row("memory stats [--repo X]",      "Memory counts per collection / per repo")
+    table.add_row("memory prune [--dry-run]",     "LRU evict from memory (pinned + young protected)")
+    table.add_row("memory compact",               "LLM-driven cluster merge of duplicate corrections")
     table.add_row("exit",                         "Exit the shell")
     console.print(table)
 
 
 async def _cmd_scan():
     from scanner.repo_scanner import scan
+    from database import init_db, add_repo, set_active_repo, get_active_repo, get_repo
 
     if not REPO_PATH:
         console.print("[red]PETCLINIC_REPO_PATH not set in .env[/red]")
@@ -141,6 +153,26 @@ async def _cmd_scan():
         except FileNotFoundError as e:
             console.print(f"[red]{e}[/red]")
             return
+
+    # Auto-register the scanned repo. `scan` is the natural discovery point;
+    # forcing the user to also run `repo add` afterwards is needless friction.
+    # Behavior: always upsert. Activate ONLY if there is no current active
+    # repo — second-scan of a different path doesn't silently switch you.
+    await init_db()
+    scanned_id = profile["repo_id"]
+    await add_repo(scanned_id, profile["repo_path"], display_name=scanned_id)
+    active = await get_active_repo()
+    if active is None:
+        await set_active_repo(scanned_id)
+        console.print(f"[green]✓ Registered + activated repo '{scanned_id}'[/green]")
+    elif active["id"] != scanned_id:
+        existing = await get_repo(scanned_id)
+        console.print(
+            f"[dim]Registered repo '{scanned_id}' "
+            f"(active stays on '{active['id']}'; "
+            f"run `repo use {scanned_id}` to switch).[/dim]"
+        )
+    # else: same repo re-scanned, no message needed
 
     console.print()
     console.print(Panel(
@@ -226,6 +258,16 @@ async def _cmd_build(requirement: str):
 async def _cmd_trace(args: list[str]):
     from cli.trace_cmd import cmd_trace
     await cmd_trace(args)
+
+
+async def _cmd_repo(args: list[str]):
+    from cli.repo_cmd import cmd_repo
+    await cmd_repo(args)
+
+
+async def _cmd_memory(args: list[str]):
+    from cli.memory_cmd import cmd_memory
+    await cmd_memory(args)
 
 
 async def _cmd_logs(task_id: str = None):

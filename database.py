@@ -69,6 +69,20 @@ async def init_db():
         except Exception:
             pass  # column already exists
 
+        # Memory slice: repo registry. Each row = one repo this workspace
+        # has memory for. At most one row carries is_active=1 (enforced by
+        # set_active_repo, not a DB constraint — sqlite has no UNIQUE WHERE
+        # predicate). All ChromaDB add/query calls scope by `id` from here.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS repo_registry (
+                id           TEXT PRIMARY KEY,
+                repo_path    TEXT NOT NULL,
+                display_name TEXT,
+                is_active    INTEGER DEFAULT 0,
+                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # Observability slice (post-P4): Langfuse-style observations table.
         # One row per LLM call (and future: tool_call / span / event).
         # Discriminator `type` lets one table cover all kinds; `parent_observation_id`
@@ -361,6 +375,82 @@ async def list_graphs() -> list[dict]:
                FROM task_graphs ORDER BY created_at DESC"""
         ) as cursor:
             return [dict(r) for r in await cursor.fetchall()]
+
+
+# ---------- Repo registry CRUD (memory slice) ----------
+
+async def list_repos() -> list[dict]:
+    """Return all registered repos, oldest first. `repo list` consumes this."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM repo_registry ORDER BY created_at"
+        ) as cursor:
+            return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_repo(repo_id: str) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM repo_registry WHERE id=?", (repo_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+
+async def add_repo(repo_id: str, repo_path: str, display_name: str | None = None) -> None:
+    """Insert (or update path/name on conflict). Does NOT touch is_active —
+    `set_active_repo` is the only call that flips that bit."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO repo_registry (id, repo_path, display_name)
+            VALUES (?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                repo_path    = excluded.repo_path,
+                display_name = excluded.display_name
+            """,
+            (repo_id, repo_path, display_name or repo_id),
+        )
+        await db.commit()
+
+
+async def set_active_repo(repo_id: str | None) -> None:
+    """Atomically flip the active row. Passing None deactivates everything
+    (no repo is current). One transaction so we never end up with two
+    active rows."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE repo_registry SET is_active = 0")
+        if repo_id is not None:
+            await db.execute(
+                "UPDATE repo_registry SET is_active = 1 WHERE id = ?",
+                (repo_id,),
+            )
+        await db.commit()
+
+
+async def get_active_repo() -> dict | None:
+    """Single source of truth for 'which repo is currently in scope'."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM repo_registry WHERE is_active = 1 LIMIT 1"
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+
+async def remove_repo(repo_id: str) -> bool:
+    """Delete the registry row only — ChromaDB cleanup is a separate
+    decision made by the CLI (`repo remove` asks the user before purging
+    memory entries). Returns True if a row was deleted."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM repo_registry WHERE id=?", (repo_id,)
+        )
+        await db.commit()
+        return (cursor.rowcount or 0) > 0
 
 
 # ---------- Observations CRUD (observability slice) ----------

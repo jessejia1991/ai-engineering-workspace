@@ -12,6 +12,10 @@ class TaskSpec(BaseModel):
     acceptance: list[str] = []
     pr_url: Optional[str] = None
     branch: Optional[str] = None
+    repo_id: Optional[str] = None  # the repo this task belongs to — used by
+                                   # reflect to attach corrections to the
+                                   # right memory pool even after the user
+                                   # has switched active repo.
 
 
 class AgentFinding(BaseModel):

@@ -713,6 +713,19 @@ async def cmd_build(requirement: str) -> None:
 async def _cmd_build_inner(requirement: str) -> None:
     await init_db()
 
+    # Memory slice guard: build writes to planning_memory + reads it on next
+    # iteration. Need an active repo for both to make sense.
+    from database import get_active_repo
+    active = await get_active_repo()
+    if not active:
+        console.print(
+            "[red]No active repo set.[/red] Run [bold]repo add <path>[/bold] "
+            "then [bold]repo use <id>[/bold]. "
+            "[dim](Or run [bold]scan[/bold] — it auto-registers + activates.)[/dim]"
+        )
+        return
+    repo_id = active["id"]
+
     try:
         repo_profile = load_profile()
     except FileNotFoundError:
@@ -729,7 +742,7 @@ async def _cmd_build_inner(requirement: str) -> None:
         f"[bold]Build[/bold]: {requirement}",
         border_style="blue",
     ))
-    console.print(f"  [dim]trace_id: {build_trace_id}[/dim]")
+    console.print(f"  [dim]trace_id: {build_trace_id} · repo: {repo_id}[/dim]")
 
     # ---------- Stage 1: plan_with_experts ----------
     with console.status("[bold blue]Running expert agents in parallel...[/bold blue]"):
@@ -792,6 +805,7 @@ async def _cmd_build_inner(requirement: str) -> None:
                 repo_profile,
                 force_plan=True,
                 clarify_history=clarify_record,
+                repo_id=repo_id,
             )
         except Exception as e:
             console.print(f"[red]DAG planner failed: {e}[/red]")
@@ -868,6 +882,7 @@ async def _cmd_build_inner(requirement: str) -> None:
             node_types     = node_types,
             edits          = edits,
             approved       = True,
+            repo_id        = repo_id,
         )
         memory_msg = "added to planning_memory"
     except Exception as e:

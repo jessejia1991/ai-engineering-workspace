@@ -31,18 +31,20 @@ The take-home asks for an AI-powered engineering workspace — a multi-agent sys
 
 The system reviews PRs by running specialized agents in parallel against a diff, surfacing findings to a human in a `reflect` step, and feeding the human's accept/reject decisions back into long-lived memory so subsequent reviews improve. Three architectural ideas matter most:
 
-### 2.1 Four-layer memory (ChromaDB)
+### 2.1 Four-layer memory (ChromaDB), repo-scoped
 
 | Layer | Scope | Grows when | Used at |
 |---|---|---|---|
-| `findings_memory` | per-agent | Any finding saved during a review | Retrieval before each agent runs |
-| `corrections_memory` | global across agents | Human rejects a finding in `reflect` with a reason | Retrieval before each agent runs |
-| `repo_profile` | repo-level | `scan` command | Injected into every prompt |
-| `planning_memory` | repo-level | Each `build` invocation on approve — stores raw requirement, clarify Q&A (if any), final graph summary, and user edits made | Queried inside `planner.py` before the LLM call to inject top-K similar past builds and their resolution patterns |
+| `findings_memory` | per-agent, per-repo | Any finding saved during a review | Retrieval before each agent runs |
+| `corrections_memory` | per-agent (global), per-repo | Human rejects a finding in `reflect` with a reason; user may `p+` to pin | Retrieval before each agent runs |
+| `repo_profile` | per-repo (file system, not ChromaDB) | `scan` command | Injected into every prompt |
+| `planning_memory` | per-repo | Each `build` invocation on approve — stores raw requirement, clarify Q&A (if any), final graph summary, and user edits made | Queried inside `planner.py` before the LLM call to inject top-K similar past builds and their resolution patterns |
 
-`planning_memory` is the system's "this user / this repo" reflection layer: every requirement breakdown leaves a trace, and similar future requirements pull these traces forward so the planner asks fewer questions and matches the user's preferred decomposition style over time. This is the build-side counterpart to `corrections_memory`'s review-side learning loop.
+**Repo isolation + hierarchical retrieval (memory slice, 2026-05-15).** Every entry carries a `repo_id` metadata. Retrieval is two-phase: phase 1 returns own-repo hits (`where={"repo_id": active}`), phase 2 fills remaining slots from the cross-repo pool. Returned items are tagged `origin='own'/'cross'` and `format_memory_for_prompt` renders `[own-repo]` / `[cross-repo]` markers so the LLM can weight the two pools differently. Rationale: engineering wisdom like "trivial getters don't need unit tests" generalizes; throwing it away on a strict isolation boundary wastes signal.
 
-Forgetting is by **time decay at retrieval time**, not deletion. Retrieval is **semantic top-K**, not full dump, so memory size doesn't blow up the prompt.
+**Lifecycle (memory slice).** Every entry also carries `last_accessed_at` (bumped on retrieval) and `pinned` (default False). `memory prune` evicts the LRU tail subject to three safeguards: pinned entries are never evicted; entries younger than `--age-floor-days` (default 7) are protected; per-collection size floor (`--max-per-collection`, default 50) is respected by counting protected items toward the floor. `memory compact` clusters semantically-similar corrections (default cosine ≥ 0.5 on the MiniLM embedder; threshold is tunable), asks the LLM to merge each cluster into one polished correction, and the human approves per cluster (y / N / q). `repo {add,use,remove,list}` manages the registry of repos this workspace has memory for.
+
+Forgetting is now both **time-decay at retrieval** (similarity weights drop for stale entries) **and** explicit eviction (`memory prune`). Retrieval is **semantic top-K**, not full dump, so memory size doesn't blow up the prompt.
 
 ### 2.2 Hidden state made observable
 
@@ -213,7 +215,7 @@ The plan in §4 addresses missing items either by building them or explicitly di
 
 ## 4. Work plan — May 14–18
 
-> **Cursor:** P1 wrap-up phase. All 4 priorities + P3 wrapper + scalability hardening + observability slice (Langfuse-style `observations` table + SDK wrapper instrumentation + `trace show / replay` CLI) landed 2026-05-14. Late-day real-PR testing on vaadin/hilla #3429 + #4533 surfaced 8 production gaps (see §16) all of which were fixed in code (retry tuning, default-branch detect, GitHub write safety + allowlist, agent_error logging, file grouping + dedup as failed-experiment record). Plan↔Review contract loop is end-to-end demoable. Remaining work: `requirements.txt` ✓, observability slice ✓, `README.md`, design doc Tradeoffs + Evaluation-Against-Brief sections (can be largely synthesized from §16). Push to origin/main is gated by user decision.
+> **Cursor:** P1 wrap-up phase. All 4 priorities + P3 wrapper + scalability hardening + observability slice + memory slice (repo-scoped retrieval + LRU prune + LLM compaction agent + `repo` / `memory` CLI surface) landed 2026-05-14/15. PROGRESS.md §16.6 + §16.7 items mostly ticked; per-engineer/team scope + memory freshness hint remain as design-doc future work. Plan↔Review contract loop is end-to-end demoable. Remaining work: `requirements.txt` ✓, observability slice ✓, memory slice ✓, `README.md`, design doc Tradeoffs + Evaluation-Against-Brief sections (can be largely synthesized from §16). Push to origin/main is gated by user decision.
 >
 > *Update this line as work progresses. Claude Code reads this on every "continue" request to find the next task.*
 
@@ -993,15 +995,77 @@ trace show TASK-PR1                          # replay nests as child of obs-623c
 - Object-storage payload backend — inline JSON is fine for current scale (largest call ≈ 25KB). Would migrate to `file:<hash>` references at ~1MB+ calls.
 - Bug fix piggybacked: `orchestrator/runner.py` was importing `query_relevant_plans` from `memory.vector_store` without importing it. Surfaced during the e2e smoke; fix is a single-line import.
 
-### 16.7 Memory layer limitations (documented; left as design discussion)
+### 16.7 Memory layer limitations
 
-Already in the system, not fixed in this delivery, recorded honestly:
+Status of each gap originally listed in this section:
 
-- **No eviction.** planning_memory / findings_memory / corrections_memory grow unbounded. Semantic retrieval still functions at 10K+ records but relevance degrades. Future: per-collection LRU + cron prune, or `archive_old_plans()` helper.
-- **No per-engineer / per-team namespacing.** Same-repo memory is shared across all reviewers. Future: add `user_id` / `team_id` metadata + filter at query time. This is Priority 5 in the original plan (design-only section).
-- **No memory freshness hint to the LLM.** Retrieved corrections might be 6 months stale; the agent doesn't know. Future: include `days_old` in the formatted memory text.
-- **No memory compaction.** Many similar corrections accumulate over time. Future: periodic re-clustering + merging via LLM call.
-- **No access control.** Anyone running `build` reads what was previously stored. Correct for a single-developer tool, worth flagging for team deployment.
+- ~~**No eviction.**~~ Resolved 2026-05-15 by the memory slice (§16.10). `memory prune` evicts LRU subject to pinned / age-floor / size-floor safeguards. `last_accessed_at` is bumped on retrieval. CLI-triggered (not auto-evicting); manual is the right shape for a take-home where the *process* is the demoable artifact, but a cron / size-threshold trigger is a natural production extension.
+- **No per-engineer / per-team namespacing.** Still not addressed. Per-repo namespacing landed (§16.10) — the engineer/team layer is its closest cousin and would slot in by adding `user_id` / `team_id` to the same metadata + extending the two-phase retrieval to three phases (user → team → repo → cross). Priority 5 in the original plan (design-only).
+- **No memory freshness hint to the LLM.** Still not addressed. `[own-repo]` / `[cross-repo]` markers (§16.10) give the LLM a *provenance* hint but not a *recency* hint. Cheapest fix: include `days_since_last_access` in the formatted memory line.
+- ~~**No memory compaction.**~~ Resolved 2026-05-15 by `memory compact`: cosine-sim clustering + LLM-driven merge with per-cluster human confirm. Phoenix/LangSmith/Braintrust prompt-playground pattern adapted to memory entries.
+- **No access control.** Still not addressed. Correct for a single-developer tool, worth flagging for team deployment.
+
+What's still unaddressed (left to design doc / future work):
+
+- **Cross-repo "weight" tuning.** Currently `[cross-repo]` items just appear after `[own-repo]` in the prompt with a one-line instruction to weight own higher. The LLM may not respect this consistently. A cleaner fix is to reweight similarity scores (multiply cross-repo by, say, 0.7) before merging the two phases — but that's prompt-engineering territory and needs empirical tuning.
+- **Orphan cleanup.** `repo remove` without purge leaves entries un-attached; they still count toward cross-repo retrieval for any other repo. A `memory cleanup-orphans` command could delete them, but the soft-cleanup semantics ("dead repo's wisdom still applies elsewhere") are arguably the right default.
+
+### 16.10 Memory slice landed 2026-05-15
+
+Repo-scoped memory + LRU prune + LLM-driven compact. Implements what §16.7 originally listed as deferred. New code: `cli/repo_cmd.py` (~190 LoC) + `cli/memory_cmd.py` (~190 LoC) + `cli/memory_compact.py` (~250 LoC). Modified: `memory/vector_store.py` (full repo-scoped rewrite, ~340 LoC), `database.py` (+repo_registry CRUD), 6 call sites threaded with `repo_id` (`runner.py`, `planner.py`, `build_cmd.py`, `reflect_cmd.py`, `review_cmd.py`, `main.py`).
+
+**CLI surface (new):**
+
+```
+repo list                                # registered repos + per-repo memory counts
+repo add <path> [--name X] [--use]       # register; optional activate
+repo use <id>                            # switch active
+repo remove <id>                         # double-prompt: typed-id confirm, then optional purge
+
+memory stats [--repo X]                  # per-repo breakdown across all 3 collections
+memory prune [--repo X] [--age-floor-days N] [--max-per-collection N] [--dry-run]
+memory compact [--repo X] [--threshold T] [--dry-run] [--auto-yes]
+```
+
+`reflect` gained a `p+` option: reject + pin the resulting correction.
+
+**Design decisions (from 2026-05-15 conversation, locked):**
+
+| Question | Decision | Rationale |
+|---|---|---|
+| Strict isolation vs hierarchical retrieval | Hierarchical (own → cross fallback, marked) | "Trivial getter/setter" wisdom generalizes; strict isolation throws it away |
+| Active repo source | Explicit CLI (`repo use`); `scan` auto-registers + auto-activates if no active | First-time path stays 0-friction; subsequent switches are intentional |
+| Migration from pre-slice data | Clean wipe of chroma_db + workspace.db | User explicitly chose simplicity over migration; tests rewritten to new schema |
+| Pruning policy | LRU + age-floor + size-floor + pin | Pure LRU evicts cold-but-valuable; the three safeguards are the minimum to keep "rare team conventions" from being lost |
+| Compact UX | Manual, per-cluster `[y/N/q]` confirm | Auto-compact via LLM is an audit nightmare; manual `--dry-run` is the demoable shape that Phoenix/LangSmith/Braintrust converged on for prompt-playground analogs |
+| Repo remove purge | Optional `[y/N]` second prompt; default N | Soft cleanup leaves entries as cross-repo wisdom for others; explicit `y` for actual purge |
+
+**Industry alignment:**
+
+- Repo-scoped metadata filter is standard multi-tenant ChromaDB usage (`where={"tenant_id": ...}`).
+- Two-phase retrieval with origin tagging is novel here but parallels Langfuse's session/trace/observation hierarchy where higher-scoped items pin retrieval.
+- Compact-via-LLM-cluster-merge mirrors MemGPT / Letta hierarchical-memory summarization; the per-cluster confirmation is what differentiates this from those agents' auto-summarize loops.
+
+**End-to-end demo (verified 2026-05-15):**
+
+```
+scan                       # auto-registers + activates 'spring-petclinic-reactjs'
+repo list                  # shows the repo, ● in active column
+review --pr 1              # writes findings_memory + execution_log + observations under repo_id=spring-petclinic-reactjs
+reflect                    # accept some, reject some with p+ to pin a correction
+memory stats               # per-repo counts
+memory prune --dry-run     # shows what LRU would evict if older than 7d, max 50/coll
+memory compact --dry-run   # cluster similar corrections, propose merges (no commit)
+memory compact             # commit merges, per-cluster confirm
+repo add /tmp/other-repo --use   # switch repos
+review --pr 1              # second repo: gets [own-repo] (its own) + [cross-repo] (petclinic's wisdom)
+```
+
+**What's not done (and why):**
+
+- **Synchronous compaction trigger inside `reflect`.** Was considered: "after N rejections, auto-suggest a compact run." Deferred — compact is a deliberate maintenance verb, not a side effect of triage. Cleaner mental model.
+- **`memory show <id>` to inspect a single entry.** Would be cheap, but `memory stats` + grepping ChromaDB is sufficient at current scale. Listed in design doc future work.
+- **Per-engineer / per-team layer.** Same metadata pattern would slot in (just add `user_id` to filter), but multi-tenancy semantics open a real design rabbit hole. Stays in design doc.
 
 ### 16.8 Other production gaps from this session
 

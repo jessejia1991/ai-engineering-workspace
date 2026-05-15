@@ -5,8 +5,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich import box
 from database import (
-    init_db, get_all_tasks, get_pending_findings,
-    update_finding_accepted, get_agent_reasoning
+    init_db, get_all_tasks, get_pending_findings, get_task,
+    update_finding_accepted, get_agent_reasoning, get_active_repo
 )
 from memory.vector_store import add_finding, add_correction, get_stats
 
@@ -77,6 +77,34 @@ async def cmd_reflect(task_id: str = None):
         console.print(f"[green]No pending findings for {task_id}.[/green]")
         return
 
+    # Memory writes go to the task's repo, not the currently-active one.
+    # User may have switched repos between the review and the reflect; we
+    # still want this task's corrections attached to the right pool.
+    task_row = await get_task(task_id)
+    task_repo_id = None
+    if task_row:
+        try:
+            artifacts = json.loads(task_row.get("artifacts") or "{}")
+            task_repo_id = artifacts.get("repo_id")
+        except (json.JSONDecodeError, TypeError):
+            pass
+    if not task_repo_id:
+        # Fallback to current active repo with a warning. Better than dropping
+        # the write entirely.
+        active = await get_active_repo()
+        if active:
+            task_repo_id = active["id"]
+            console.print(
+                f"[yellow]⚠ Task {task_id} has no recorded repo_id; "
+                f"falling back to active repo '{task_repo_id}'.[/yellow]"
+            )
+        else:
+            console.print(
+                f"[red]Task {task_id} has no recorded repo_id and no active "
+                f"repo is set. Run [bold]repo use <id>[/bold] first.[/red]"
+            )
+            return
+
     # Per-agent reasoning chains from the review run (Design Doc 4.3) —
     # fetched once, shared across all findings from the same agent.
     reasoning_by_agent = await get_agent_reasoning(task_id)
@@ -119,6 +147,7 @@ async def cmd_reflect(task_id: str = None):
         console.print("  [bold][[green]a[/green]]ccept  "
                       "[[red]r[/red]]eject  "
                       "[[yellow]r+[/yellow]] reject with reason  "
+                      "[[magenta]p+[/magenta]] reject + pin correction  "
                       "[[dim]s[/dim]]kip[/bold]")
 
         while True:
@@ -131,7 +160,7 @@ async def cmd_reflect(task_id: str = None):
             if choice == "a":
                 # Accept: write to SQLite + ChromaDB
                 await update_finding_accepted(finding_id, True)
-                add_finding(finding_id, content, accepted=True)
+                add_finding(finding_id, content, accepted=True, repo_id=task_repo_id)
                 console.print("  [green]✓ Accepted — added to memory[/green]")
                 accepted_count += 1
                 break
@@ -139,13 +168,16 @@ async def cmd_reflect(task_id: str = None):
             elif choice == "r":
                 # Reject without reason
                 await update_finding_accepted(finding_id, False)
-                add_finding(finding_id, content, accepted=False)
+                add_finding(finding_id, content, accepted=False, repo_id=task_repo_id)
                 console.print("  [red]✗ Rejected[/red]")
                 rejected_count += 1
                 break
 
-            elif choice == "r+":
-                # Reject with reason — writes to corrections_memory
+            elif choice in ("r+", "p+"):
+                # Reject with reason — writes to corrections_memory.
+                # `p+` additionally pins the correction so `memory prune`
+                # cannot evict it (use for high-value team conventions).
+                pin = (choice == "p+")
                 try:
                     reason = console.input("  Reason: ").strip()
                 except (KeyboardInterrupt, EOFError):
@@ -158,14 +190,17 @@ async def cmd_reflect(task_id: str = None):
                         note=reason,
                         example=f"Finding rejected: {content.get('title', '')}",
                         correction_type="false-positive",
+                        repo_id=task_repo_id,
+                        pinned=pin,
                     )
+                    pin_note = " (pinned)" if pin else ""
                     console.print(f"  [red]✗ Rejected[/red] — "
-                                  f"[dim]correction saved to memory[/dim]")
+                                  f"[dim]correction saved to memory{pin_note}[/dim]")
                 else:
                     console.print("  [red]✗ Rejected[/red]")
 
                 await update_finding_accepted(finding_id, False)
-                add_finding(finding_id, content, accepted=False)
+                add_finding(finding_id, content, accepted=False, repo_id=task_repo_id)
                 rejected_count += 1
                 break
 
@@ -175,7 +210,7 @@ async def cmd_reflect(task_id: str = None):
                 break
 
             else:
-                console.print("  [dim]Please enter a, r, r+, or s[/dim]")
+                console.print("  [dim]Please enter a, r, r+, p+, or s[/dim]")
 
         console.print()
 
