@@ -273,6 +273,11 @@ def scan(repo_root: str = None) -> dict:
     except Exception:
         apis = []
 
+    # 5b. Health-check endpoint detection. The verify pipeline + the
+    # ArchitectureAgent both consume this: verify uses it for the CD-gate
+    # probe; Architecture flags HIGH if missing on a deployable backend.
+    runtime["health_endpoint"] = _detect_health_endpoint(apis, classification)
+
     profile = {
         "repo_id": os.path.basename(repo_root),
         "repo_path": repo_root,
@@ -305,6 +310,47 @@ def scan(repo_root: str = None) -> dict:
         json.dump(profile, f, indent=2)
 
     return profile
+
+
+_HEALTH_PATH_HINTS = (
+    "/health", "/healthz", "/actuator/health", "/ping",
+    "/status", "/ready", "/readiness", "/live", "/liveness",
+)
+
+
+def _detect_health_endpoint(apis: list[dict], classification: dict) -> str | None:
+    """
+    Return the detected health-check path or None.
+      - First preference: an extracted API whose path looks like a health
+        check (case-insensitive match against the hint list, exact or
+        suffix).
+      - Second preference: Spring Actuator presence in pom.xml. The
+        Actuator dependency ships `/actuator/health` even when it's not
+        in the OpenAPI spec, so we infer the path.
+    Both checks are intentionally cheap — this runs on every scan.
+    """
+    for api in apis:
+        if api.get("method", "").upper() != "GET":
+            continue
+        path = (api.get("path") or "").lower()
+        if path in _HEALTH_PATH_HINTS:
+            return api.get("path")
+        # Suffix match catches /api/health when class-mapping is "api"
+        for hint in _HEALTH_PATH_HINTS:
+            if path.endswith(hint):
+                return api.get("path")
+
+    # Spring Actuator inferred presence
+    for f in classification.get("build", []):
+        if not f.endswith("pom.xml"):
+            continue
+        try:
+            with open(os.path.join(os.path.dirname(CONTEXT_FILE), "..", f)) as fh:
+                if "spring-boot-starter-actuator" in fh.read():
+                    return "/actuator/health"
+        except Exception:
+            pass
+    return None
 
 
 def load_profile() -> dict:

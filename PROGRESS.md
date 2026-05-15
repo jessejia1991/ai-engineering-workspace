@@ -186,7 +186,7 @@ The individual files have been smoke-tested in prior conversations, but **end-to
 | Architecture review | ✓ done — ArchitectureAgent (review-side: layering / coupling / module-boundary) + plan-phase angle via `build_requirement_prompt` |
 | Regression detection | ⚠ reframed — corrections_memory + Contract enforcement together provide regression-of-known-issue detection without a dedicated agent; documented as architectural choice in design doc (no separate RegressionAgent) |
 | Refactoring recommendations | ✓ done — RefactoringAgent (method/file scope: naming, duplication, dead code, type-safety) |
-| CI/CD validation, deployment checks | ✓ partial — `verify generate` produces Python e2e tests targeting detected APIs; `verify run` pytest-executes them against a running target ($VERIFY_TARGET_URL); `verify run` failure-analysis classifies test-bug-* vs regression and feeds lessons back into next-generation prompt. Lifecycle of the target system is the user's responsibility (deliberate scope decision — "we are an external tester, not a deployment automation tool") |
+| CI/CD validation, deployment checks | ✓ — full pipeline. CI: `review --pr N --strict --post` (review gate) + `verify health-check` (CD readiness gate) + `verify generate --diff` + `verify run --diff` (e2e gate). Self-hosted runner workflow at `examples/petclinic-ci.yml`. Health-endpoint detection in scanner; ArchitectureAgent flags HIGH-severity when missing. The target system's deploy lifecycle (build / start / teardown) is handled in the workflow YAML, not our tool — deliberate scope choice |
 | Risk scoring | ✓ `RiskReport` rendered as a panel at end of every review (severity-weighted, with merge recommendation) |
 
 **Explicit evaluation dimensions:**
@@ -227,7 +227,7 @@ The plan in §4 addresses missing items either by building them or explicitly di
 
 ## 4. Work plan — May 14–18
 
-> **Cursor:** P1 wrap-up phase. All 4 priorities + P3 wrapper + scalability hardening + observability slice + memory slice + `init` wizard + brief-coverage slice (Architecture/Refactoring/TestGeneration agents) + **verify slice** (runtime + API detection at scan time; external Python e2e test generation; pytest run + failure-analysis loop; `test_catalog` 5th memory layer) all landed 2026-05-14/15. §3.4 coverage now ✓ on **10 of 11** brief workflows (only test execution stays partial — we run our own generated e2e tests, not the project's internal test suite, which is a deliberate scope decision). Plan↔Review contract loop + Verify loop both end-to-end demoable. Remaining work: `README.md` + design doc Tradeoffs + Evaluation-Against-Brief sections. Push to origin/main is gated by user decision.
+> **Cursor:** P1 wrap-up phase. All 4 priorities + production-readiness + observability slice + memory slice + `init` wizard + brief-coverage slice + verify slice + **CI/CD Phase 1** (non-interactive click subcommands · `review --strict` · `verify health-check` · health endpoint detection + Architecture flag · catalog dedup · committed demo tests · self-hosted-runner workflow at `examples/petclinic-ci.yml`) all landed 2026-05-14/15. §3.4 now ✓ on **all 11** brief workflows. Plan↔Review contract loop + Verify loop + CI/CD pipeline all demoable. Remaining: Phase 2 `apply` command + README major section + design doc Tradeoffs + Evaluation-Against-Brief sections. Push to origin/main is gated by user decision.
 >
 > *Update this line as work progresses. Claude Code reads this on every "continue" request to find the next task.*
 
@@ -830,8 +830,28 @@ than through `execution_log`.
 ```bash
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-python -m cli.main     # auto-triggers `init` wizard on first run
+python -m cli.main     # auto-triggers `init` wizard on first run, opens shell
 ```
+
+For **non-interactive / CI** use, every interactive command is also a click
+subcommand. Exit codes follow CI conventions (`0` success · `1` gate
+failure · `2` setup/runtime error):
+
+```bash
+python -m cli.main scan
+python -m cli.main review --pr 42 --post --strict        # CI gate
+python -m cli.main verify generate --diff --max 3
+python -m cli.main verify run --diff                     # exit 1 on test fail
+python -m cli.main verify health-check                   # CD gate; exit 0 if up
+python -m cli.main repo list
+python -m cli.main memory stats
+```
+
+`--strict` (review): exit 1 when any `must_have` contract criterion is
+`FAIL` or any finding has severity `critical`. Advisory severity
+(`high/medium/low`) is posted but doesn't fail the gate. A full
+GitHub Actions workflow that wires these together for petclinic lives
+at `examples/petclinic-ci.yml` — see §17 for the demo flow.
 
 The `init` wizard asks for `ANTHROPIC_API_KEY` (required, hidden), model
 (Sonnet 4.6 / Opus 4.7), optional `GITHUB_TOKEN` + `GITHUB_REPO`, and the
@@ -1179,6 +1199,51 @@ verify catalog search "list owners returns JSON"
 | Multi-language test generation (JUnit, Jest natively) | We chose to **always** generate Python, since we test from outside. Project language doesn't matter |
 | Happy-path POST with full payloads | LLM-without-schema-context produces too many false negatives. Validation tests are more reliable and still cover the API surface |
 | Generated-test execution as a step inside `review` | Two separate flows by design (locked in conversation). Review = fast static analysis. Verify = slow runtime-against-deployed |
+
+### 16.13 CI/CD pipeline Phase 1 landed 2026-05-15
+
+The verify slice closed the e2e-testing loop. This phase wires the whole pipeline together as a runnable GitHub Actions workflow on a self-hosted runner. Phase 2 (the `apply` command for `/apply`-comment-driven auto-fix) is wired in the workflow YAML but the CLI itself lands next.
+
+**What this slice adds:**
+
+1. **Non-interactive click subcommands** — every interactive command is now also `python -m cli.main <subcommand>` with exit codes suitable for CI (`0` success, `1` gate failure, `2` setup error). The interactive shell stays unchanged.
+
+2. **`review --strict`** — CI-gate exit code. Fails on `must_have` contract FAIL or `critical` finding. Advisory severities (`high/medium/low`) post to the PR but don't break the gate. Reasoning: review is help, not authority — only blockers should block.
+
+3. **`verify health-check`** — CD-gate command. Probes `$VERIFY_TARGET_URL` (or detected health endpoint), exit `0` if service responds, `1` if not. Used in the workflow's "wait for petclinic ready" step in a retry loop.
+
+4. **Health endpoint detection at scan time** — `runtime.health_endpoint` set from OpenAPI paths matching `/health` / `/healthz` / `/actuator/health` / `/ping` / `/status` / `/ready` / `/live`, or inferred from Spring Actuator presence in pom.xml.
+
+5. **ArchitectureAgent flags missing health endpoint** — when scan finds no health path on a deployable backend (Spring Boot / Express / FastAPI), the agent emits a HIGH-severity finding with framework-specific suggestion. This is the deliberate "review pushes for better deployability" loop the user asked for. Verified on petclinic: no health endpoint → ArchitectureAgent finds it.
+
+6. **`verify generate` deduplicates against catalog** — before paying tokens, check if any catalog entry already covers a target API. Drop covered ones from the prompt. First run = full sweep; subsequent runs incremental. Resulting structure stays flat (`<test_id>.py`) since `test_catalog` already provides semantic indexing.
+
+7. **Persisted demo tests** — `.ai-workspace/generated-tests/` removed from .gitignore; petclinic's 2 generated tests now ship in the repo as reproducible artifacts. A reviewer who clones sees example output without running anything.
+
+8. **`examples/petclinic-ci.yml`** — full GitHub Actions workflow:
+   - `pull_request` job: scan → review --strict --post → mvn package → start petclinic → poll health-check → verify generate --diff → verify run --diff → teardown
+   - `issue_comment` job (gated by `contains(body, '/apply')`): runs `apply --pr N --comment-id C --push` to commit AI-applied fixes to the PR branch. (Phase 2 — CLI for `apply` lands next.)
+
+**Verified on petclinic (2026-05-15) — non-interactive entrypoints:**
+
+```
+$ python -m cli.main scan
+  Runtime: react + spring-boot · port 9966 · no health endpoint  ← surfaced
+  APIs:    36 endpoint(s) (6 DELETE, 14 GET, 9 POST, 7 PUT)
+
+$ python -m cli.main verify health-check
+  ✗ Could not reach http://localhost:9966: Connection refused
+  exit=1
+
+$ python -m cli.main repo list
+  (Rich table with active marker, exit 0)
+```
+
+Click subcommand surface aligns with interactive shell — same names + flags, same output, only difference is exit code propagation. No new behavior, all wiring.
+
+**Phase 2 still ahead (~3-4h):**
+- `cli/apply_cmd.py` — fetch PR comment by id, parse `/apply [extra-instruction]`, load finding from the corresponding TASK-PR<N>, LLM call to produce updated file content, diff, optional `--push` to PR branch.
+- README major section: "Demo with self-hosted runner" — install runner, register, set secrets, walk through the end-to-end loop.
 
 ### 16.8 Other production gaps from this session
 

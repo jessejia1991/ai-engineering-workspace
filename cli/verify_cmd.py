@@ -55,27 +55,36 @@ GENERATED_TESTS_ROOT = WORKSPACE_ROOT / ".ai-workspace" / "generated-tests"
 
 # ---------- dispatcher --------------------------------------------------
 
-async def cmd_verify(args: list[str]) -> None:
+async def cmd_verify(args: list[str]) -> int:
+    """Returns exit code. 0 = success; non-zero = failure (verify run / health-check)."""
     if not args:
         console.print(
             "[red]Usage: verify generate [--diff] [--max N] [--apis ...]  |  "
             "verify run [--diff] [--url URL] [--no-analyze]  |  "
+            "verify health-check [--url URL]  |  "
             "verify list  |  verify catalog search \"<query>\"[/red]"
         )
-        return
+        return 1
 
     action = args[0]
     rest = args[1:]
     if action == "generate":
         await _verify_generate(rest)
+        return 0
     elif action == "run":
-        await _verify_run(rest)
+        return await _verify_run(rest)
+    elif action == "health-check":
+        from cli.verify_run import run_verify_health_check
+        return await run_verify_health_check(rest)
     elif action == "list":
         await _verify_list(rest)
+        return 0
     elif action == "catalog":
         await _verify_catalog(rest)
+        return 0
     else:
         console.print(f"[red]Unknown verify action: {action}[/red]")
+        return 1
 
 
 # ---------- shared helpers ----------------------------------------------
@@ -263,6 +272,39 @@ async def _verify_generate(rest: list[str]) -> None:
         # If diff matches nothing, fall through to all apis (avoids "0 tests
         # generated because the heuristic was too strict").
 
+    # Dedup against existing catalog. For each target API, check if any
+    # catalog entry already covers it. If yes, drop from the target list —
+    # we don't pay tokens to regenerate what's already there.
+    target_keys = [f"{a['method']} {a['path']}" for a in target_apis]
+    if target_keys:
+        already_covered = query_tests_by_apis(target_keys, repo_id)
+        covered_set: set[str] = set()
+        for hit in already_covered:
+            covered_raw = (hit.get("metadata") or {}).get("apis_covered", "")
+            covered_set.update(c.strip() for c in covered_raw.split(",") if c.strip())
+        if covered_set:
+            kept_apis = []
+            dropped = []
+            for a, key in zip(target_apis, target_keys):
+                if key in covered_set:
+                    dropped.append(key)
+                else:
+                    kept_apis.append(a)
+            target_apis = kept_apis
+            if dropped:
+                console.print(
+                    f"  [dim]Skipping {len(dropped)} API(s) already covered by catalog: "
+                    f"{', '.join(dropped[:5])}{'...' if len(dropped) > 5 else ''}[/dim]"
+                )
+
+    if not target_apis:
+        console.print(
+            "[green]Nothing to generate — every targeted API already has a "
+            "test in the catalog.[/green] "
+            "[dim](Use `verify list` to inspect; delete entries to regenerate.)[/dim]"
+        )
+        return
+
     # Pull lessons (corrections of type="test-gen-lesson")
     lessons_block = await _format_lessons(repo_id)
     existing_block = _format_existing(repo_id)
@@ -446,10 +488,9 @@ def _format_existing(repo_id: str) -> str:
 
 # ---------- verify run, list, catalog: placeholders for V4 + V5 ----------
 
-async def _verify_run(rest: list[str]) -> None:
-    # Implemented in V4
+async def _verify_run(rest: list[str]) -> int:
     from cli.verify_run import run_verify_run
-    await run_verify_run(rest)
+    return await run_verify_run(rest)
 
 
 async def _verify_list(rest: list[str]) -> None:

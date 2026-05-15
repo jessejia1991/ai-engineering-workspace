@@ -28,8 +28,11 @@ class ArchitectureAgent(BaseAgent):
 
         files_text  = self._format_files(file_contents)
         memory_text = self._format_memory(memory)
+        ops_block   = self._format_ops_readiness(repo_profile)
 
         return f"""You are an architecture-review reviewer for a software engineering team.
+
+{ops_block}
 
 ## Relevant memory from past reviews
 {memory_text}
@@ -62,6 +65,25 @@ class ArchitectureAgent(BaseAgent):
 
 If your only finding is "this method is too long" or "this name is unclear", do not report — leave it to Refactoring.
 
+## Operational readiness — a special checklist item
+If the "Operational readiness" block above says **NO health endpoint
+detected** AND the runtime is a deployable backend (Spring Boot, Express,
+FastAPI, etc.), you MUST emit one finding with:
+  - severity: high
+  - category: ops-readiness
+  - title: "Missing health-check endpoint — required for safe CI/CD"
+  - detail: explains that the current code has no `/health`, `/healthz`,
+    `/actuator/health`, or equivalent, so CD pipelines cannot verify the
+    service is live after deploy
+  - suggestion: concrete framework-specific path. For Spring Boot, recommend
+    adding `spring-boot-starter-actuator` to `pom.xml` and confirming
+    `/actuator/health` is exposed. For Express, recommend adding a tiny
+    `GET /health` handler.
+
+This finding is independent of the diff — emit it on every review until
+the runtime detection picks up a health endpoint. It is the single most
+common CI/CD readiness gap and the reviewer wants it surfaced.
+
 ## Rules
 - Only report issues with clear evidence in the actual code or its location.
 - Cite specific file paths, package boundaries, or call chains.
@@ -70,6 +92,23 @@ If your only finding is "this method is too long" or "this name is unclear", do 
 
 {self._reasoning_instructions()}
 """
+
+    def _format_ops_readiness(self, repo_profile: dict) -> str:
+        """Surface the runtime-detection signals that matter for the
+        ops-readiness rule below."""
+        runtime = repo_profile.get("runtime") or {}
+        frameworks = runtime.get("frameworks") or []
+        port = runtime.get("port")
+        hp = runtime.get("health_endpoint")
+        lines = ["## Operational readiness signals (from scan)"]
+        lines.append(f"  - frameworks: {', '.join(frameworks) or 'unknown'}")
+        if port:
+            lines.append(f"  - server port: {port}")
+        if hp:
+            lines.append(f"  - health endpoint: {hp} (good — verify pipeline can probe it)")
+        else:
+            lines.append("  - health endpoint: NO health endpoint detected — see operational-readiness checklist below")
+        return "\n".join(lines)
 
     # ----- P4 plan-phase: review_requirement -----
 

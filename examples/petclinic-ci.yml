@@ -1,0 +1,161 @@
+# =============================================================================
+# AI-engineering-workspace + petclinic — end-to-end CI/CD pipeline example.
+# =============================================================================
+#
+# This file is a template. Copy it into your petclinic fork at
+#   .github/workflows/ai-review.yml
+# then register a self-hosted GitHub Actions runner on the same machine that
+# has both this `ai-engineering-workspace` repo cloned AND petclinic's Maven
+# build environment (JDK 17+ + Maven).
+#
+# What this pipeline does:
+#   - On pull_request: scan + AI review (--strict gate) + build + start
+#     petclinic locally + verify health-check + verify generate + verify run.
+#     If any test fails or the strict review gate trips, the PR check fails.
+#   - On issue_comment containing "/apply": run `apply --pr N --comment-id C`
+#     to let the AI commit the suggested fix straight to the PR branch.
+#     (Phase 2 — apply command. Job is wired now; the CLI lands in the next
+#     slice.)
+#
+# Prerequisites on the self-hosted runner:
+#   1. Python 3.12 + venv at $AI_TOOL_PATH/venv (this repo's venv)
+#   2. `python -m cli.main init` run once interactively to configure
+#      ANTHROPIC_API_KEY + model in the runner's .env
+#   3. The petclinic clone available — `actions/checkout` puts it at
+#      $GITHUB_WORKSPACE for each run
+#   4. Repository secrets in petclinic fork:
+#        - ANTHROPIC_API_KEY              (your Anthropic key; same as runner's .env)
+#        - REVIEW_ALLOWED_REPOS           (e.g. "your-user/spring-petclinic-reactjs")
+#   5. The GITHUB_TOKEN that GHA injects automatically has enough scope to
+#      post PR comments and push to PR branches (default-branch-protected
+#      pushes won't work; PR branches in the fork do).
+#
+# Tuning knobs (env vars):
+#   AI_TOOL_PATH          absolute path to the ai-engineering-workspace clone
+#   VERIFY_TARGET_URL     overrides the URL `verify run` probes (default
+#                         derived from runtime detection, e.g. localhost:9966)
+#   ANTHROPIC_MODEL       claude-sonnet-4-6 or claude-opus-4-7
+# =============================================================================
+
+name: AI Engineering Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+# Pin paths the workflow needs. Adjust AI_TOOL_PATH to wherever you cloned
+# the workspace repo on your self-hosted runner.
+env:
+  AI_TOOL_PATH: ${{ vars.AI_TOOL_PATH || '/Users/runner/workspace/ai-engineering-workspace' }}
+  PETCLINIC_REPO_PATH: ${{ github.workspace }}
+  GITHUB_REPO: ${{ github.repository }}
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-sonnet-4-6' }}
+  REVIEW_ALLOWED_REPOS: ${{ secrets.REVIEW_ALLOWED_REPOS }}
+  REVIEW_POST_COMMENTS: 'true'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # CI job: AI review + build + verify against the locally-deployed petclinic.
+  # ---------------------------------------------------------------------------
+  review-and-verify:
+    if: github.event_name == 'pull_request'
+    runs-on: self-hosted
+    timeout-minutes: 25
+    steps:
+      - name: Checkout petclinic PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so `git diff` against base works
+
+      - name: AI scan
+        working-directory: ${{ env.AI_TOOL_PATH }}
+        run: |
+          source venv/bin/activate
+          python -m cli.main scan
+
+      # CI gate 1 — AI multi-agent review. --strict makes the run fail
+      # when a must_have contract criterion is FAIL or any finding has
+      # critical severity. Advisory findings (high/medium/low) are posted
+      # to the PR but don't fail the check.
+      - name: AI review
+        working-directory: ${{ env.AI_TOOL_PATH }}
+        run: |
+          source venv/bin/activate
+          python -m cli.main review --pr ${{ github.event.pull_request.number }} --post --strict
+
+      - name: Build petclinic
+        run: mvn -B package -DskipTests
+
+      # CD gate — start the service in background, wait until the
+      # health endpoint responds, then run our external e2e tests.
+      - name: Start petclinic
+        run: |
+          nohup mvn -B spring-boot:run > /tmp/petclinic.log 2>&1 &
+          echo "$!" > /tmp/petclinic.pid
+
+      - name: Wait for petclinic ready
+        working-directory: ${{ env.AI_TOOL_PATH }}
+        run: |
+          source venv/bin/activate
+          for i in $(seq 1 30); do
+            if python -m cli.main verify health-check ; then
+              echo "petclinic is up"; exit 0
+            fi
+            echo "  (attempt $i/30) waiting 5s..."; sleep 5
+          done
+          echo "petclinic did not become ready in 150s"; tail -100 /tmp/petclinic.log; exit 1
+
+      # CI gate 2 — external e2e tests. The catalog dedups against
+      # already-generated tests, so this only ever costs LLM tokens for
+      # APIs touched by the diff that aren't covered yet.
+      - name: AI verify (generate + run)
+        working-directory: ${{ env.AI_TOOL_PATH }}
+        run: |
+          source venv/bin/activate
+          python -m cli.main verify generate --diff --max 3
+          python -m cli.main verify run --diff
+
+      - name: Stop petclinic
+        if: always()
+        run: |
+          if [ -f /tmp/petclinic.pid ]; then
+            kill "$(cat /tmp/petclinic.pid)" || true
+          fi
+          # Belt-and-suspenders for the Maven wrapper child process.
+          pkill -f 'spring-boot:run' || true
+
+  # ---------------------------------------------------------------------------
+  # AI-apply job: on PR comments containing "/apply", let the AI commit the
+  # suggested fix to the PR branch. Phase 2 wires the `apply` command — the
+  # YAML is here now so the workflow surface is one commit, not two.
+  # ---------------------------------------------------------------------------
+  ai-apply:
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request != null &&
+      contains(github.event.comment.body, '/apply')
+    runs-on: self-hosted
+    timeout-minutes: 10
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          # GHA's default checkout fetches the PR head ref via the
+          # merge-commit. For `apply` to push back to the branch we need
+          # the actual head branch checked out at the head SHA.
+          fetch-depth: 0
+          ref: refs/pull/${{ github.event.issue.number }}/head
+
+      - name: AI apply
+        working-directory: ${{ env.AI_TOOL_PATH }}
+        run: |
+          source venv/bin/activate
+          python -m cli.main apply \
+            --pr ${{ github.event.issue.number }} \
+            --comment-id ${{ github.event.comment.id }} \
+            --target-path ${{ github.workspace }} \
+            --push

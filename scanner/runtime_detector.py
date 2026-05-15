@@ -269,4 +269,9 @@ def runtime_summary(runtime: dict) -> str:
     port = runtime.get("port")
     if port:
         bits.append(f"port {port}")
+    hp = runtime.get("health_endpoint")
+    if hp:
+        bits.append(f"health={hp}")
+    else:
+        bits.append("[red]no health endpoint[/red]")
     return " · ".join(bits) if bits else "no runtime detected"

@@ -44,7 +44,7 @@ GENERATED_TESTS_ROOT = WORKSPACE_ROOT / ".ai-workspace" / "generated-tests"
 
 # ---------- verify run --------------------------------------------------
 
-async def run_verify_run(rest: list[str]) -> None:
+async def run_verify_run(rest: list[str]) -> int:
     use_diff = False
     url: str | None = None
     do_analyze = True
@@ -64,13 +64,13 @@ async def run_verify_run(rest: list[str]) -> None:
             i += 2
         else:
             console.print(f"[red]Unknown flag: {a}[/red]")
-            return
+            return 2
 
     await init_db()
     active = await get_active_repo()
     if not active:
         console.print("[red]No active repo set. Run [bold]repo use <id>[/bold] first.[/red]")
-        return
+        return 2
     repo_id = active["id"]
 
     # Resolve URL: --url > env > runtime.port default
@@ -92,7 +92,7 @@ async def run_verify_run(rest: list[str]) -> None:
             f"[red]No generated tests under {repo_dir.relative_to(WORKSPACE_ROOT)}.[/red] "
             f"Run [bold]verify generate[/bold] first."
         )
-        return
+        return 2
 
     selected_files: list[Path] = []
     if use_diff and not select_all:
@@ -141,13 +141,13 @@ async def run_verify_run(rest: list[str]) -> None:
         )
     except subprocess.TimeoutExpired:
         console.print("[red]pytest timed out after 120s[/red]")
-        return
+        return 1
     except FileNotFoundError:
         console.print(
             "[red]pytest not found in PATH.[/red] "
             "Install: [bold]pip install pytest requests[/bold]"
         )
-        return
+        return 2
 
     stdout = proc.stdout
     stderr = proc.stderr
@@ -198,6 +198,9 @@ async def run_verify_run(rest: list[str]) -> None:
             "\n[dim]Pass --analyze to LLM-classify failures and write "
             "lessons to corrections_memory.[/dim]"
         )
+
+    # Exit code: 0 if all green, 1 if any test failed or errored.
+    return 1 if (n_fail or n_err) else 0
 
 
 def _apis_for_diff(profile: dict) -> list[str]:
@@ -489,6 +492,100 @@ async def run_verify_list(rest: list[str]) -> None:
             last_run,
         )
     console.print(table)
+
+
+# ---------- verify health-check -----------------------------------------
+
+async def run_verify_health_check(rest: list[str]) -> int:
+    """
+    HTTP probe against the target system. Returns:
+      0 — service responded (200/201/3xx/404 all count: any response means
+          the server is up; 404 just means the probe path isn't bound).
+      1 — connection refused / timeout / 5xx server error / unreachable.
+
+    Used as a CD gate in the GitHub Actions workflow — exit-code-driven
+    so the workflow can `if: success()`.
+    """
+    import urllib.request, urllib.error, socket
+
+    url: str | None = None
+    timeout = 5.0
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == "--url" and i + 1 < len(rest):
+            url = rest[i + 1]; i += 2
+        elif a == "--timeout" and i + 1 < len(rest):
+            try:
+                timeout = float(rest[i + 1])
+            except ValueError:
+                pass
+            i += 2
+        else:
+            console.print(f"[red]Unknown flag: {a}[/red]")
+            return 1
+
+    # Resolve URL: --url > env > runtime.health_endpoint > runtime.port > 8080
+    try:
+        profile = load_profile()
+    except FileNotFoundError:
+        profile = {}
+    runtime = profile.get("runtime") or {}
+
+    if not url:
+        base = os.environ.get("VERIFY_TARGET_URL")
+        if not base:
+            port = runtime.get("port", 8080)
+            base = f"http://localhost:{port}"
+        health = runtime.get("health_endpoint")
+        if health:
+            # If health is like "/actuator/health" or "/api/health", join
+            url = base.rstrip("/") + (health if health.startswith("/") else "/" + health)
+        else:
+            url = base
+
+    console.print(f"[dim]Probing {url}  (timeout {timeout}s)[/dim]")
+
+    try:
+        req = urllib.request.Request(url, method="GET", headers={
+            "User-Agent": "ai-eng-verify-healthcheck/1.0",
+            "Accept": "*/*",
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.status
+        if 200 <= status < 400 or status == 404:
+            console.print(
+                f"[green]✓ Service is up[/green] "
+                f"[dim](HTTP {status} from {url})[/dim]"
+            )
+            return 0
+        if 500 <= status:
+            console.print(
+                f"[red]✗ Service error[/red] "
+                f"[dim](HTTP {status} from {url})[/dim]"
+            )
+            return 1
+        # 4xx other than 404 — server is up but rejecting the probe shape.
+        # Count as up (service is responding).
+        console.print(
+            f"[yellow]⚠ Service responded with {status}[/yellow] "
+            f"[dim]({url}) — treating as up[/dim]"
+        )
+        return 0
+    except urllib.error.HTTPError as e:
+        # urllib raises HTTPError for 4xx/5xx
+        if 500 <= e.code:
+            console.print(f"[red]✗ HTTP {e.code} from {url}[/red]")
+            return 1
+        console.print(f"[yellow]⚠ HTTP {e.code} from {url} — treating as up[/yellow]")
+        return 0
+    except (urllib.error.URLError, socket.timeout, ConnectionRefusedError, OSError) as e:
+        console.print(
+            f"[red]✗ Could not reach {url}: {type(e).__name__}: {e}[/red]\n"
+            f"[dim]Is the target system running? "
+            f"Start it (e.g. `mvn spring-boot:run`) and retry.[/dim]"
+        )
+        return 1
 
 
 # ---------- verify catalog search ---------------------------------------

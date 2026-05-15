@@ -144,11 +144,16 @@ def _render_agent_reasoning(reasoning_by_agent: dict, agents_run: list):
 
 async def cmd_review(pr_number: int, branch: str = None, *,
                      graph_id: str = None, no_graph: bool = False,
-                     post_decision: bool | None = None):
+                     post_decision: bool | None = None,
+                     strict: bool = False) -> int:
+    """Returns exit code. 0 = OK. 1 = strict gate failure (must_have FAIL or
+    critical finding when --strict is set). 2 = setup/runtime error."""
+    code = 0
     try:
-        await _cmd_review_inner(pr_number, branch,
-                                graph_id=graph_id, no_graph=no_graph,
-                                post_decision=post_decision)
+        code = await _cmd_review_inner(pr_number, branch,
+                                       graph_id=graph_id, no_graph=no_graph,
+                                       post_decision=post_decision,
+                                       strict=strict)
     finally:
         # P3: LLM usage observability — print on every exit path
         # (success, RuntimeError, unexpected exception). Reset for next.
@@ -156,11 +161,13 @@ async def cmd_review(pr_number: int, branch: str = None, *,
         if usage["requests"] > 0:
             console.print(f"[dim]LLM usage: {format_usage_summary(usage)}[/dim]")
         llm_client.reset_usage()
+    return code or 0
 
 
 async def _cmd_review_inner(pr_number: int, branch: str = None, *,
                             graph_id: str = None, no_graph: bool = False,
-                            post_decision: bool | None = None):
+                            post_decision: bool | None = None,
+                            strict: bool = False) -> int:
     from orchestrator.runner import run_review
     from github_client import post_review_comments, get_pr_description
     from database import get_agent_reasoning, init_db, get_active_repo
@@ -175,7 +182,7 @@ async def _cmd_review_inner(pr_number: int, branch: str = None, *,
             "then [bold]repo use <id>[/bold] before reviewing. "
             "[dim]Or just run [bold]scan[/bold] — it auto-registers + activates.[/dim]"
         )
-        return
+        return 2
 
     console.print()
     console.print(
@@ -211,7 +218,7 @@ async def _cmd_review_inner(pr_number: int, branch: str = None, *,
         )
     except RuntimeError as e:
         console.print(f"\n[red]Error: {e}[/red]")
-        return
+        return 2
     except Exception as e:
         console.print(f"\n[red]Unexpected error: {e}[/red]")
         raise
@@ -328,3 +335,31 @@ async def _cmd_review_inner(pr_number: int, branch: str = None, *,
         f"run 'reflect' to accept/reject findings[/dim]"
     )
     console.print()
+
+    # --strict gate (CI-friendly exit code):
+    #   1 if any must_have criterion is FAIL
+    #   1 if any finding has severity == 'critical'
+    #   0 otherwise
+    # 'request_changes' alone is NOT enough to fail — that's advisory.
+    if strict:
+        contract = risk_report.contract_summary or {}
+        any_must_fail = any(
+            (c.get("priority") == "must_have" and c.get("status") == "FAIL")
+            for c in (contract.get("criteria") or [])
+        )
+        has_critical = any(
+            (getattr(f, "severity", None) or "").lower() == "critical"
+            for f in findings
+        )
+        if any_must_fail or has_critical:
+            reason = []
+            if any_must_fail:
+                reason.append("must_have FAIL in contract")
+            if has_critical:
+                reason.append("critical-severity finding")
+            console.print(
+                f"[red]✗ --strict gate failed: {' + '.join(reason)}[/red]"
+            )
+            return 1
+        console.print("[green]✓ --strict gate passed[/green]")
+    return 0

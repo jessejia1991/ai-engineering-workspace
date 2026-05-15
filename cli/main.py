@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 import json
 import click
 from rich.console import Console
@@ -80,6 +81,7 @@ def _interactive_shell():
             graph_id = None
             no_graph = False
             post_decision = None         # None = use env; True = force; False = force-skip
+            strict = False
             i = 0
             while i < len(args):
                 if args[i] == "--pr" and i+1 < len(args):
@@ -100,13 +102,16 @@ def _interactive_shell():
                 elif args[i] == "--no-post":
                     post_decision = False
                     i += 1
+                elif args[i] == "--strict":
+                    strict = True
+                    i += 1
                 else:
                     i += 1
             if pr_number is None:
                 console.print("[red]Usage: review --pr <number> [--branch <name>] "
-                              "[--graph GRAPH-xyz | --no-graph] [--post | --no-post][/red]")
+                              "[--graph GRAPH-xyz | --no-graph] [--post | --no-post] [--strict][/red]")
             else:
-                asyncio.run(_cmd_review(pr_number, branch, graph_id, no_graph, post_decision))
+                asyncio.run(_cmd_review(pr_number, branch, graph_id, no_graph, post_decision, strict))
         elif cmd == "reflect":
             task_id = args[0] if args else None
             asyncio.run(_cmd_reflect(task_id))
@@ -276,10 +281,11 @@ async def _cmd_status():
 
 async def _cmd_review(pr_number: int, branch: str = None,
                       graph_id: str = None, no_graph: bool = False,
-                      post_decision: bool = None):
+                      post_decision: bool = None,
+                      strict: bool = False) -> int:
     from cli.review_cmd import cmd_review
-    await cmd_review(pr_number, branch, graph_id=graph_id, no_graph=no_graph,
-                     post_decision=post_decision)
+    return await cmd_review(pr_number, branch, graph_id=graph_id, no_graph=no_graph,
+                            post_decision=post_decision, strict=strict)
 
 
 async def _cmd_reflect(task_id: str = None):
@@ -307,9 +313,9 @@ async def _cmd_memory(args: list[str]):
     await cmd_memory(args)
 
 
-async def _cmd_verify(args: list[str]):
+async def _cmd_verify(args: list[str]) -> int:
     from cli.verify_cmd import cmd_verify
-    await cmd_verify(args)
+    return await cmd_verify(args)
 
 
 async def _cmd_init():
@@ -398,6 +404,133 @@ async def _cmd_logs(task_id: str = None):
             console.print(f"  [red]retry #{attempt}: {error}[/red]")
 
         console.print()
+
+
+# ===========================================================================
+# Non-interactive click subcommands — the CI-friendly entry points.
+# ===========================================================================
+#
+# These wrap the existing async helpers and exit with a meaningful code so
+# GitHub Actions and other CI runners can gate on them. The interactive
+# shell handlers above stay unchanged for human use.
+#
+# Invocation form:
+#   python -m cli.main scan
+#   python -m cli.main review --pr 42 --strict --post
+#   python -m cli.main verify generate --diff --max 3
+#   python -m cli.main verify run --diff
+#   python -m cli.main verify health-check
+#   python -m cli.main repo list
+#   python -m cli.main memory stats
+#
+# Exit-code conventions:
+#   0 — success
+#   1 — gate failure (strict-mode review found a blocker; test failed)
+#   2 — setup/runtime error (missing repo, missing API key, etc.)
+
+
+@cli.command(name="scan", help="Scan the configured repo path and update the profile.")
+def _click_scan():
+    asyncio.run(_cmd_scan())
+
+
+@cli.command(name="review", help="Run multi-agent review on a PR.")
+@click.option("--pr", "pr_number", required=True, type=int, help="PR number")
+@click.option("--branch", default=None, help="Branch (alternative to --pr)")
+@click.option("--graph", "graph_id", default=None, help="Pin to a specific contract graph id")
+@click.option("--no-graph", is_flag=True, help="Force generic review, skip contract auto-match")
+@click.option("--post/--no-post", "post_decision", default=None,
+              help="Override REVIEW_POST_COMMENTS (post / skip GitHub comments)")
+@click.option("--strict", is_flag=True,
+              help="Exit 1 on must_have FAIL or critical-severity finding. For CI gates.")
+def _click_review(pr_number, branch, graph_id, no_graph, post_decision, strict):
+    code = asyncio.run(_cmd_review(pr_number, branch, graph_id, no_graph, post_decision, strict))
+    sys.exit(int(code or 0))
+
+
+# `verify`, `repo`, and `memory` are subgroups themselves. Click supports
+# this natively: nested click.Group. The existing dispatchers in
+# cli/verify_cmd.py / cli/repo_cmd.py / cli/memory_cmd.py take a list[str],
+# so we forward `extra_args` through.
+
+@cli.group(name="verify", help="External e2e test generation / run / health-check.")
+def _click_verify():
+    pass
+
+
+def _verify_subcmd_factory(action: str, help_text: str):
+    """Generate a click subcommand under `verify` that forwards all extra
+    args (after the action name) to the existing async dispatcher."""
+    @_click_verify.command(name=action, help=help_text,
+                           context_settings={"ignore_unknown_options": True,
+                                             "allow_extra_args": True})
+    @click.argument("extra", nargs=-1)
+    def _cmd(extra):
+        code = asyncio.run(_cmd_verify([action, *extra]))
+        sys.exit(int(code or 0))
+    _cmd.__name__ = f"_click_verify_{action.replace('-', '_')}"
+    return _cmd
+
+
+_verify_subcmd_factory("generate",     "Generate Python e2e tests for detected APIs.")
+_verify_subcmd_factory("run",          "Run generated tests against $VERIFY_TARGET_URL. Exit 1 on test failure.")
+_verify_subcmd_factory("health-check", "Probe $VERIFY_TARGET_URL. Exit 0 if up, 1 if not.")
+_verify_subcmd_factory("list",         "List test catalog entries.")
+_verify_subcmd_factory("catalog",      "Catalog search subcommand. Usage: verify catalog search \"<query>\"")
+
+
+@cli.group(name="repo", help="Repo registry management.")
+def _click_repo():
+    pass
+
+
+def _repo_subcmd_factory(action: str, help_text: str):
+    @_click_repo.command(name=action, help=help_text,
+                         context_settings={"ignore_unknown_options": True,
+                                           "allow_extra_args": True})
+    @click.argument("extra", nargs=-1)
+    def _cmd(extra):
+        asyncio.run(_cmd_repo([action, *extra]))
+    _cmd.__name__ = f"_click_repo_{action.replace('-', '_')}"
+    return _cmd
+
+
+_repo_subcmd_factory("list",   "List registered repos.")
+_repo_subcmd_factory("add",    "Register a repo. Usage: repo add <path> [--name X] [--use]")
+_repo_subcmd_factory("use",    "Switch active repo. Usage: repo use <id>")
+_repo_subcmd_factory("remove", "Unregister a repo (with optional purge).")
+
+
+@cli.group(name="memory", help="Memory layer maintenance.")
+def _click_memory():
+    pass
+
+
+def _memory_subcmd_factory(action: str, help_text: str):
+    @_click_memory.command(name=action, help=help_text,
+                           context_settings={"ignore_unknown_options": True,
+                                             "allow_extra_args": True})
+    @click.argument("extra", nargs=-1)
+    def _cmd(extra):
+        asyncio.run(_cmd_memory([action, *extra]))
+    _cmd.__name__ = f"_click_memory_{action.replace('-', '_')}"
+    return _cmd
+
+
+_memory_subcmd_factory("stats",   "Memory counts per repo / collection.")
+_memory_subcmd_factory("prune",   "LRU prune the memory pool.")
+_memory_subcmd_factory("compact", "LLM-driven cluster-merge of corrections.")
+
+
+@cli.command(name="init", help="Re-run the setup wizard.")
+def _click_init():
+    asyncio.run(_cmd_init())
+
+
+@cli.command(name="logs", help="Show execution log for a task.")
+@click.argument("task_id", required=False)
+def _click_logs(task_id):
+    asyncio.run(_cmd_logs(task_id))
 
 
 if __name__ == "__main__":

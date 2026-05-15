@@ -8,4 +8,9 @@ reports/
 .ai-workspace/chroma_db/
 .ai-workspace/repo-context.json
 .ai-workspace/task-memory/
-.ai-workspace/generated-tests/
+
+# Generated tests are kept under .ai-workspace/generated-tests/<repo_id>/.
+# We DO track these — they ship as reproducible demo artifacts so a
+# reviewer cloning the repo sees an example of what `verify generate`
+# produces against petclinic. New entries are added by `verify generate`
+# and should be committed alongside other source changes.
