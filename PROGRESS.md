@@ -68,35 +68,45 @@ This closes the loop between plan and review: the plan-phase contract is the ver
 
 ## 3. Current implementation status
 
-### 3.1 File inventory (`temp-branch` HEAD)
+### 3.1 File inventory (`main` HEAD `e309c25`, 2026-05-14)
 
 ```
 ai-engineering-workspace/
 ├── .env.example
+├── CLAUDE.md                          Working-rules for Claude Code
+├── PROGRESS.md                        This file
+├── requirements.txt
 ├── agents/
-│   ├── base.py                  (181)  BaseAgent + reasoning schema
+│   ├── base.py                  (466)  BaseAgent + review() / review_requirement() + reasoning schema + contract_block
 │   ├── bug_finding.py           ( 51)
-│   ├── performance.py           ( 43)
-│   ├── security.py              ( 52)
-│   ├── testing.py               ( 42)
-│   └── uiux.py                  ( 43)
+│   ├── delivery.py              ( 73)  P4 plan-phase-only expert (raises in review())
+│   ├── llm_client.py            (442)  P3 rate-limited wrapper + observability instrumentation (contextvars + write_observation)
+│   ├── performance.py           ( 88)
+│   ├── security.py              ( 96)
+│   ├── testing.py               ( 86)
+│   └── uiux.py                  ( 87)
 ├── cli/
-│   ├── main.py                  (275)  Interactive shell + click commands
-│   ├── reflect_cmd.py           (192)  Human triage UI
-│   └── review_cmd.py            (184)  Run a review on a PR
-├── database.py                  (222)  aiosqlite schema + helpers
-├── github_client.py             (154)  Post review comments to GitHub
+│   ├── build_cmd.py             (885)  P2/P4 build pipeline + Architect Report UX + Contract editing
+│   ├── main.py                  (315)  Interactive shell + dispatch
+│   ├── reflect_cmd.py           (192)  Human triage UI + correction write-back
+│   ├── review_cmd.py            (316)  Run a review on a PR + GitHub post (allowlist-gated)
+│   └── trace_cmd.py             (435)  `trace show` / `trace replay` observability CLI
+├── database.py                  (455)  aiosqlite schema + helpers (tasks · findings · exec_log · graphs · observations)
+├── github_client.py             (206)  Post review comments to GitHub (two-gate safety)
 ├── memory/
-│   └── vector_store.py          (218)  ChromaDB three-layer memory
-├── models.py                    ( 47)  Pydantic models
+│   └── vector_store.py          (342)  ChromaDB four-layer memory (findings · corrections · repo_profile · planning_memory)
+├── models.py                    (106)  Pydantic models (TaskSpec, AgentFinding, TaskGraph, Contract, Criterion, ...)
 ├── orchestrator/
-│   ├── agent_selector.py        (159)  Rule + LLM agent selection
-│   └── runner.py                (255)  run_review pipeline
-└── scanner/
-    └── repo_scanner.py          (269)  scan, classify, repo_profile
+│   ├── agent_selector.py        (233)  Rule + LLM agent selection + select_experts_for_plan
+│   ├── planner.py               (598)  P2 single-pass planner + P4 plan_with_experts + Synthesizer
+│   └── runner.py                (534)  run_review pipeline + find_graph_for_pr auto-match
+├── scanner/
+│   └── repo_scanner.py          (301)  scan, classify, repo_profile, _default_branch auto-detect
+└── tests/
+    └── test_memory.py                  Standalone vector_store smoke test
 ```
 
-**Missing:** `README.md`, `requirements.txt`. (`.gitignore` exists but is incomplete — missing `.ai-workspace/`, `workspace.db`, `.cache/`; see §5.2. `tests/` now contains `test_memory.py` from §12 verification.)
+**Missing:** `README.md` (last reviewer-facing gap). `.gitignore` already covers `.ai-workspace/`, `workspace.db`, `__pycache__/`, `venv/`.
 
 ### 3.2 What works (Day 1–3)
 
@@ -148,6 +158,8 @@ The individual files have been smoke-tested in prior conversations, but **end-to
 
 ### 3.4 Coverage vs the brief
 
+**Explicit workflows from the brief:**
+
 | Brief item | Status |
 |---|---|
 | Automated code review | ✓ done |
@@ -155,16 +167,45 @@ The individual files have been smoke-tested in prior conversations, but **end-to
 | Security analysis | ✓ done (SecurityAgent) |
 | UI/UX critique | ✓ done (UIUXAgent) |
 | Performance optimization | ✓ done (PerformanceAgent) |
-| PR review automation | ✓ done |
+| PR review automation | ✓ done (GitHub post via `--post`, allowlist-gated) |
 | Test generation and execution | ⚠ TestingAgent does test *review* not *generation* — gap |
-| Architecture review | ✗ no agent |
+| Architecture review | ⚠ partial — the multi-expert plan phase covers architecture *concerns* at requirement time (P4 Chunk B); no dedicated review-side architecture agent |
 | Regression detection | ✗ not built |
 | Refactoring recommendations | ✗ not built |
 | CI/CD validation, deployment checks | ✗ explicitly deferred (no CI integration in scope) |
-| Risk scoring | ⚠ `RiskReport` model exists, not surfaced |
-| README | ✗ missing |
-| Design document | ✓ v4 exists |
-| Tradeoffs + limitations discussion | ✗ missing |
+| Risk scoring | ✓ `RiskReport` rendered as a panel at end of every review (severity-weighted, with merge recommendation) |
+
+**Explicit evaluation dimensions:**
+
+| Dimension | Status |
+|---|---|
+| System design | ✓ four-layer memory + plan↔review contract loop + agent contract documented in §13 |
+| Agent orchestration | ✓ rule+LLM agent selection · contract-owner union · parallel fan-out under bounded concurrency |
+| Reliability | ✓ retry on 429/529 with `Retry-After` honoring + exp backoff + per-request timeout + agent_error logging |
+| Scalability | ⚠ partial — HTTP wrapper enforces session-wide concurrency cap + token budget. File grouping experiment failed (see §16.3); roadmap of mitigations in §16.4 |
+| Observability | ✓ execution_log + observations table (Langfuse-style) + `trace show / replay` (see §16.5 + §16.9) |
+| Safety | ✓ GitHub-write two-gate (allowlist + opt-in flag) · no-write default · explicit blocked-by-allowlist message |
+| Developer experience | ✓ Rich-rendered shell · `LLM usage` printed every command · trace_id printed for `build` |
+
+**Bonus signals from the brief:**
+
+| Bonus item | Status |
+|---|---|
+| Self-improving agents | ✓ corrections_memory + planning_memory closed-loop (§2.1, §6) |
+| Feedback loops | ✓ `reflect` accept/reject writes back to ChromaDB; planning_memory captures user edits |
+| Memory / reflection systems | ✓ four-layer ChromaDB with semantic retrieval + time decay |
+| Multi-agent coordination | ✓ P4 plan-phase multi-expert + Synthesizer + per-criterion ownership in review |
+
+**Deliverables:**
+
+| Item | Status |
+|---|---|
+| Source code | ✓ on `main`, 9 commits ahead of `origin/main` |
+| `requirements.txt` | ✓ done (`ca9c971`) |
+| README | ✗ missing — top remaining wrap-up item |
+| Design document | ✓ v4 `.docx` exists |
+| Tradeoffs + limitations discussion | ⚠ partial — material is in PROGRESS.md §16, not yet reformatted into design doc |
+| Evaluation Against Brief | ⚠ partial — this §3.4 table is the seed; design doc section pending |
 
 The plan in §4 addresses missing items either by building them or explicitly discussing the cutoff in the design doc.
 
@@ -582,9 +623,13 @@ If P4 chunks A–D run long, fall back to the §4.3 fallback: keep expert plan +
 
 ---
 
-## 12. Day 3 verification path (run this before any new work)
+## 12. End-to-end verification path (regression smoke)
 
-This is the verification path for the uncommitted Day 3 changes (§3.3). Run it first.
+Originally the Day-3 acceptance test for the closed memory loop. Now kept as the
+shortest e2e regression smoke covering the P1 review/reflect/memory loop. Was
+last run against current `main` on 2026-05-14; rerun if anything in `agents/`,
+`memory/vector_store.py`, `database.py`, or `orchestrator/runner.py` changes
+substantially.
 
 1. **`scan`** → confirm `repo_profile` written
 2. **`review --pr <N>`** (first run) → verify:
@@ -612,21 +657,47 @@ If any step fails, fix before moving on.
 class BaseAgent(ABC):
     name: str   # e.g. "SecurityAgent"
 
+    # Review-side entrypoint (P1 + P4 Chunk D)
     async def review(
         self,
         task: TaskSpec,
         diff: str,
         file_contents: dict,
         repo_profile: dict,
-        memory: dict,                       # from query_relevant_memory()
-    ) -> tuple[list[AgentFinding], dict]:   # (findings, reasoning)
+        memory: dict,                                  # from query_relevant_memory()
+        owned_criteria: list[dict] | None = None,      # P4: criteria this agent must verify
+    ) -> tuple[list[AgentFinding], dict]:              # (findings, reasoning)
+        ...
+
+    # Plan-phase entrypoint (P4 Chunk B)
+    # Expert agents (Security/UIUX/Testing/Performance/Delivery) opt in by
+    # overriding build_requirement_prompt; non-experts (BugFindingAgent)
+    # raise NotImplementedError and are filtered out by select_experts_for_plan.
+    async def review_requirement(
+        self,
+        requirement: str,
+        repo_profile: dict,
+        memory: dict | None = None,
+    ) -> dict:
+        # Returns:
+        #   {
+        #     "perspective_summary": "...",
+        #     "clarify_questions":   [...],
+        #     "design_suggestions":  [{priority: high|medium|low, ...}, ...],
+        #     "proposed_criteria":   [{priority: must_have|should_have|nice_to_have, ...}, ...],
+        #     "_raw_response":       "...",
+        #     "_stop_reason":        "...",
+        #   }
         ...
 
     @abstractmethod
     def build_prompt(self, task, diff, file_contents, repo_profile, memory) -> str: ...
+
+    # Optional, overridden only by expert agents (P4 Chunk B)
+    def build_requirement_prompt(self, requirement, repo_profile, memory) -> str: ...
 ```
 
-The LLM must return JSON of this exact shape (validated in `parse_response`):
+The review LLM must return JSON of this shape (validated in `parse_response`):
 
 ```json
 {
@@ -635,16 +706,24 @@ The LLM must return JSON of this exact shape (validated in `parse_response`):
     "rejected_candidates": [
       {"issue": "...", "why_rejected": "...", "confidence_to_reject": 0.0-1.0}
     ],
-    "confidence_per_finding": {"finding_0": 0.0-1.0}
+    "confidence_per_finding": {"finding_0": 0.0-1.0},
+    "contract_status": [
+      {"criterion_id": "c1", "status": "PASS|FAIL|UNVERIFIED",
+       "evidence": "file:line or why-unverifiable"}
+    ]
   },
   "findings": [
     {"severity": "low|medium|high|critical", "category": "...", "title": "...",
-     "detail": "...", "suggestion": "...", "file": "...", "line": 42}
+     "detail": "...", "suggestion": "...", "file": "...", "line": 42,
+     "criterion_id": "c1"}
   ]
 }
 ```
 
-Legacy fallback: bare array of findings is accepted (no reasoning recorded).
+`contract_status` is required when the agent receives `owned_criteria`; missing
+criteria get synthesized as `UNVERIFIED` stubs by `BaseAgent.review` so the
+renderer never silently loses a criterion. Legacy fallback: bare array of
+findings is accepted (no reasoning recorded).
 
 ### 13.2 Memory API (`memory/vector_store.py`)
 
@@ -667,7 +746,10 @@ get_stats() -> dict
 ### 13.3 Database API (`database.py`)
 
 ```python
-init_db()                                                # idempotent
+# Core (P1)
+init_db()                                                # idempotent — runs all
+                                                         # CREATE TABLE IF NOT EXISTS
+                                                         # + idempotent ALTER for migrations
 create_task(task_id, task_type, artifacts)               # upsert (resets to PENDING)
 update_task_status(task_id, status)
 get_all_tasks() / get_task(task_id)
@@ -678,21 +760,52 @@ update_finding_accepted(finding_id, accepted: bool)
 log_execution(task_id, event_type, agent, payload)
 get_execution_log(task_id)
 get_agent_reasoning(task_id)                             # parsed per-agent dict
+
+# Task graphs (P2 + P4)
+save_graph(graph)                                        # upsert; serializes nodes + contract
+load_graph(graph_id) -> dict | None                      # rebuilds via TaskGraph(**)
+list_graphs() -> list[dict]                              # summary rows, no nodes_json
+update_node_status(graph_id, node_id, new_status) -> bool
+
+# Observations (observability slice)
+save_observation(*, observation_id, trace_id, type, ...) # one row per LLM call
+get_observations_by_trace(trace_id) -> list[dict]        # oldest first; tree built client-side
+get_observation(observation_id) -> dict | None
 ```
 
-Tables: `tasks`, `task_findings`, `execution_log`. New for Priority 2: `task_graphs` table.
+Tables (after all migrations have run):
+
+| Table | Owner | Notes |
+|---|---|---|
+| `tasks` | P1 | Status machine (`PENDING / IN_PROGRESS / REVIEWING / DONE / …`) |
+| `task_findings` | P1 | Per-finding row; `accepted IS NULL` = pending triage |
+| `execution_log` | P1 + extensions | Append-only event stream; see §13.4 |
+| `task_graphs` | P2 + P4 | `nodes_json` + `contract_json` (idempotent ALTER for pre-P4 rows) |
+| `observations` | Observability slice | Langfuse-style: `type` discriminator + `parent_observation_id` + `replayed_from_id`; indexed by `trace_id` and `parent_observation_id` |
 
 ### 13.4 Execution log event types
 
-| `event_type` | `agent` | `payload` shape |
+Actually emitted by the code on `main` (verified by grep on `log_execution(`):
+
+| `event_type` | `agent` | `payload` shape | Emitted from |
+|---|---|---|---|
+| `agent_selection` | `"orchestrator"` | `{selected, skipped, reasoning, changed_files, contract_graph_id, contract_criteria_count}` | `orchestrator/runner.py` |
+| `agent_result` | agent name | `{attempt, latency_ms, finding_count, status, reasoning, memory_injected, owned_criteria_count}` | `orchestrator/runner.py:execute_agent_with_retry` |
+| `agent_retry` | agent name | `{attempt, latency_ms, error}` | `orchestrator/runner.py:execute_agent_with_retry` |
+| `agent_error` | agent name | `{exception_type, exception_text, is_rate_limit, is_api_status, had_owned_criteria}` | `agents/base.py:review` (added in production-readiness bundle) |
+| `contract_status` | `"orchestrator"` | `{criterion_id, status, evidence, owner_agent}` (one row per criterion) | `orchestrator/runner.py` (P4 Chunk D) |
+
+**Not emitted** (despite earlier P3 design): `agent_queued`, `agent_started`,
+`agent_timeout`, `budget_exceeded`. P3 was rescoped to an HTTP-layer wrapper
+(see §7) that surfaces these counters via `usage_summary()` on the CLI rather
+than through `execution_log`.
+
+**Adjacent observability surfaces** (not via `execution_log`):
+
+| Surface | Where it lives | Notes |
 |---|---|---|
-| `agent_selection` | `"orchestrator"` | `{selected, skipped, reasoning, changed_files}` |
-| `agent_result` | agent name | `{attempt, latency_ms, finding_count, status, reasoning, memory_injected}` |
-| `agent_retry` | agent name | `{attempt, error}` |
-| `agent_queued` (Priority 3) | agent name | `{queued_at, queue_depth}` |
-| `agent_started` (Priority 3) | agent name | `{started_at}` |
-| `agent_timeout` (Priority 3) | agent name | `{timeout_after_ms}` |
-| `budget_exceeded` (Priority 3) | `"scheduler"` | `{budget_type, used, cap}` |
+| `usage_summary` line | printed by `cli/review_cmd.py` + `cli/build_cmd.py` on every exit path | `{requests, retries, timeouts, input_tokens, output_tokens, budget_blocks}` |
+| `observations` table | written by `agents/llm_client.py` wrapper | one row per LLM call; full request_kwargs + response; queryable via `trace show / replay` |
 
 `get_agent_reasoning()` reads `agent_result` rows only.
 
@@ -700,18 +813,29 @@ Tables: `tasks`, `task_findings`, `execution_log`. New for Priority 2: `task_gra
 
 ## 14. Running the system (current state)
 
-Once `requirements.txt` exists:
-
 ```bash
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # edit: ANTHROPIC_API_KEY, GITHUB_TOKEN, GITHUB_REPO, PETCLINIC_REPO_PATH
+# Optional for GitHub posting demo (off by default for safety; see §16.2):
+#   REVIEW_ALLOWED_REPOS=jessejia1991/spring-petclinic-reactjs
+#   REVIEW_POST_COMMENTS=true
 python -m cli.main     # interactive shell
 ```
 
-Shell commands: `scan`, `review --pr N [--branch X]`, `reflect [TASK-ID]`, `logs [TASK-ID]`, `tasks`, `quit`.
+Shell commands:
 
-After Priority 2 lands: `build "<requirement>"` for the breakdown workflow.
+| Command | Purpose |
+|---|---|
+| `scan` | Build repo profile (P1) |
+| `review --pr N [--branch X] [--graph GRAPH-xyz \| --no-graph] [--post \| --no-post]` | Multi-agent review of a PR, with optional contract auto-match (P1 + P4) |
+| `reflect [TASK-ID]` | Human triage of pending findings (P1) |
+| `logs [TASK-ID]` | Execution log timeline (P1) |
+| `build "<requirement>"` | Multi-expert plan → Architect Report → Contract → TaskGraph (P2 + P4) |
+| `trace show <trace_id> [--prompt]` | Rich tree of all LLM observations for a trace (observability slice) |
+| `trace replay <obs_id>` | Re-run one captured generation with an edited prompt; nest result in trace tree (observability slice) |
+| `status` | List all tasks |
+| `quit` | Exit shell |
 
 ---
 
@@ -722,8 +846,9 @@ To answer during walk-through prep, not before:
 1. **Repo-scoped vs global memory** — should petclinic corrections surface when reviewing a Python project? Currently no repo filter on corrections.
 2. **Memory bootstrapping** — first review is always cold-start. Should `scan` pre-populate from a curated `seed_corrections.json`?
 3. **Confidence thresholds** (Design Doc §3.4) — where do they live? Today agents don't filter by confidence.
-4. **Priority 2 advance engine — fully automatic vs always-pause-for-human?** Likely the latter for safety.
-5. **Priority 4 conflict definition** — "same file + line range" is simplest but may miss semantic conflicts across files.
+4. **Priority 2 advance engine — fully automatic vs always-pause-for-human?** Decided 2026-05-14: cut from scope (always-pause if it ever lands). The conservative breakdown + edit + persist path is what shipped; auto-advance stays documented as future work in the design doc.
+5. **Priority 4 conflict definition** — "same file + line range" is simplest but may miss semantic conflicts across files. *Status:* deferred — the contract criteria pattern shipped (P4 Chunks A-D) sidesteps this by making each criterion explicitly owned and verified per agent; cross-agent contradiction handling at finding level is still open.
+6. **Cross-task `trace_id` linking** *(new, observability slice)* — a `build` writes `trace_id = build-<uuid>` while a `review --pr N` writes `trace_id = TASK-PRN`. The two are joined only via `planning_memory` (semantic match on PR description). Should we add an explicit `parent_trace_id` to chain build → multiple reviews of the resulting PRs? See §16.6.
 
 ---
 
