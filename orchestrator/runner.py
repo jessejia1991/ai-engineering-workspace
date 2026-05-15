@@ -488,12 +488,15 @@ async def run_review(
         all_findings = _dedupe_findings(all_findings)
         status(f"Deduped findings across groups: {pre} → {len(all_findings)}")
 
-    # Now save (post-dedupe). Skip findings with status != 'ok'.
+    # Now save (post-dedupe). Skip findings with status != 'ok'. Pass the
+    # AgentFinding's own id so the DB row matches what's in GitHub comments
+    # — `apply` looks up by that id.
     for f in all_findings:
         if f.status == "ok":
             await save_finding(
                 task_id, f.agent,
-                f.severity, f.model_dump()
+                f.severity, f.model_dump(),
+                finding_id=f.finding_id,
             )
 
     # 9. Aggregate

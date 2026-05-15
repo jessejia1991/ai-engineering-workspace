@@ -181,15 +181,23 @@ async def get_task(task_id: str):
             return dict(row) if row else None
 
 
-async def save_finding(task_id: str, agent: str, severity: str, content: dict):
-    finding_id = str(uuid.uuid4())[:8]
+async def save_finding(task_id: str, agent: str, severity: str, content: dict,
+                       finding_id: str | None = None):
+    """
+    Persist a finding. If finding_id is provided (the normal path from
+    BaseAgent / runner), reuse it so the AgentFinding's id matches the DB
+    row id — that's the only id GitHub-posted comments use, and `apply`
+    looks up by it. Caller passes `f.finding_id`; legacy callers that
+    don't pass anything still get a fresh id.
+    """
+    fid = finding_id or str(uuid.uuid4())[:8]
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO task_findings (id, task_id, agent, severity, content) VALUES (?, ?, ?, ?, ?)",
-            (finding_id, task_id, agent, severity, json.dumps(content))
+            (fid, task_id, agent, severity, json.dumps(content))
         )
         await db.commit()
-    return finding_id
+    return fid
 
 
 async def get_pending_findings(task_id: str):
