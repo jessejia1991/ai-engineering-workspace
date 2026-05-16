@@ -539,7 +539,14 @@ def _git_commit_and_push(target: Path, records: list[dict],
     ]
     commit_msg = "\n".join(msg_lines)
 
-    rc, out, err = _git(target, "commit", "-m", commit_msg)
+    # Pass the author/committer identity inline (-c ...) so the commit
+    # works on a fresh self-hosted runner that has no global git config.
+    rc, out, err = _git(
+        target,
+        "-c", "user.name=ai-engineering-workspace",
+        "-c", "user.email=noreply@anthropic.com",
+        "commit", "-m", commit_msg,
+    )
     if rc != 0:
         if "nothing to commit" in (out + err).lower():
             console.print("[yellow]No staged changes — nothing to commit.[/yellow]")
