@@ -2,39 +2,39 @@
 # AI-engineering-workspace + petclinic — end-to-end CI/CD pipeline example.
 # =============================================================================
 #
-# This file is a template. Copy it into your petclinic fork at
-#   .github/workflows/ai-review.yml
-# then register a self-hosted GitHub Actions runner on the same machine that
-# has both this `ai-engineering-workspace` repo cloned AND petclinic's Maven
-# build environment (JDK 17+ + Maven).
+# Copy this into your petclinic fork at .github/workflows/ai-review.yml, then
+# register a self-hosted GitHub Actions runner on a machine that has the
+# petclinic build toolchain.
+#
+# The workflow provisions the AI tool itself — you do NOT pre-clone it and
+# there is NO AI_TOOL_PATH variable to set. The "Prepare AI tool" step clones
+# (or fast-forwards) the tool into $HOME/ai-engineering-workspace and builds
+# its venv. $HOME resolves to whatever user the runner runs as, so the path is
+# deterministic without any per-machine configuration.
 #
 # What this pipeline does:
-#   - On pull_request: scan + AI review (--strict gate) + build + start
-#     petclinic locally + verify health-check + verify generate + verify run.
-#     If any test fails or the strict review gate trips, the PR check fails.
-#   - On issue_comment containing "/apply": run `apply --pr N --comment-id C`
-#     to let the AI commit the suggested fix straight to the PR branch.
-#     (Phase 2 — apply command. Job is wired now; the CLI lands in the next
-#     slice.)
+#   - On pull_request: provision the AI tool, scan + AI review (--strict gate),
+#     build petclinic, start it locally, verify health-check, then generate +
+#     run external e2e tests. A failed test or a tripped strict gate fails the
+#     PR check.
+#   - On issue_comment containing "/apply": apply the chosen review fixes and
+#     commit them to the PR branch.
 #
-# Prerequisites on the self-hosted runner:
-#   1. Python 3.12 + venv at $AI_TOOL_PATH/venv (this repo's venv)
-#   2. `python -m cli.main init` run once interactively to configure
-#      ANTHROPIC_API_KEY + model in the runner's .env
-#   3. The petclinic clone available — `actions/checkout` puts it at
-#      $GITHUB_WORKSPACE for each run
-#   4. Repository secrets in petclinic fork:
-#        - ANTHROPIC_API_KEY              (your Anthropic key; same as runner's .env)
-#        - REVIEW_ALLOWED_REPOS           (e.g. "your-user/spring-petclinic-reactjs")
-#   5. The GITHUB_TOKEN that GHA injects automatically has enough scope to
-#      post PR comments and push to PR branches (default-branch-protected
-#      pushes won't work; PR branches in the fork do).
+# Prerequisites on the self-hosted runner (run it as a normal user account via
+# `./run.sh` — not a privileged or `runner`-system context):
+#   1. Python 3.12+ and git on PATH
+#   2. JDK 17+ and Maven on PATH (to build/run petclinic)
+#   3. Network access to github.com and api.anthropic.com
 #
-# Tuning knobs (env vars):
-#   AI_TOOL_PATH          absolute path to the ai-engineering-workspace clone
-#   VERIFY_TARGET_URL     overrides the URL `verify run` probes (default
-#                         derived from runtime detection, e.g. localhost:9966)
-#   ANTHROPIC_MODEL       claude-sonnet-4-6 or claude-opus-4-7
+# Repository secrets to set in the petclinic fork (Settings > Secrets and
+# variables > Actions):
+#   - ANTHROPIC_API_KEY     your Anthropic key
+#   - REVIEW_ALLOWED_REPOS  e.g. "your-user/spring-petclinic-reactjs"
+# Optional repository variable:
+#   - ANTHROPIC_MODEL       claude-sonnet-4-6 (default) or claude-opus-4-7
+#
+# If your AI tool repo is not jessejia1991/ai-engineering-workspace, edit
+# AI_TOOL_REPO in the two "Prepare AI tool" steps below.
 # =============================================================================
 
 name: AI Engineering Review
@@ -45,10 +45,7 @@ on:
   issue_comment:
     types: [created]
 
-# Pin paths the workflow needs. Adjust AI_TOOL_PATH to wherever you cloned
-# the workspace repo on your self-hosted runner.
 env:
-  AI_TOOL_PATH: ${{ vars.AI_TOOL_PATH || '/Users/runner/workspace/ai-engineering-workspace' }}
   PETCLINIC_REPO_PATH: ${{ github.workspace }}
   GITHUB_REPO: ${{ github.repository }}
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -56,6 +53,11 @@ env:
   ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-sonnet-4-6' }}
   REVIEW_ALLOWED_REPOS: ${{ secrets.REVIEW_ALLOWED_REPOS }}
   REVIEW_POST_COMMENTS: 'true'
+  # Base URL the external e2e tests + health-check target. petclinic-rest
+  # serves its API under the /petclinic context path and an /api prefix —
+  # this must match the `servers:` url in the app's openapi spec. Change it
+  # if you point the pipeline at a different service.
+  VERIFY_TARGET_URL: 'http://localhost:9966/petclinic/api'
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -71,17 +73,40 @@ jobs:
         with:
           fetch-depth: 0   # full history so `git diff` against base works
 
+      # Clone-or-update the AI tool into a deterministic $HOME-relative path
+      # and export AI_TOOL_PATH for the steps below. First run also creates
+      # the venv; later runs reuse it. No variable, no pre-clone needed.
+      - name: Prepare AI tool
+        run: |
+          set -e
+          AI_TOOL_PATH="$HOME/ai-engineering-workspace"
+          AI_TOOL_REPO="https://github.com/jessejia1991/ai-engineering-workspace.git"
+          if [ -d "$AI_TOOL_PATH/.git" ]; then
+            # Force-sync to origin. The clone is a CI artifact — local
+            # runtime writes must never block or diverge from the remote.
+            git -C "$AI_TOOL_PATH" fetch --quiet origin
+            git -C "$AI_TOOL_PATH" reset --hard --quiet origin/main
+          else
+            git clone "$AI_TOOL_REPO" "$AI_TOOL_PATH"
+          fi
+          [ -d "$AI_TOOL_PATH/venv" ] || python3 -m venv "$AI_TOOL_PATH/venv"
+          "$AI_TOOL_PATH/venv/bin/pip" install -q -r "$AI_TOOL_PATH/requirements.txt"
+          echo "AI_TOOL_PATH=$AI_TOOL_PATH" >> "$GITHUB_ENV"
+
       - name: AI scan
         working-directory: ${{ env.AI_TOOL_PATH }}
         run: |
           source venv/bin/activate
           python -m cli.main scan
 
-      # CI gate 1 — AI multi-agent review. --strict makes the run fail
-      # when a must_have contract criterion is FAIL or any finding has
-      # critical severity. Advisory findings (high/medium/low) are posted
-      # to the PR but don't fail the check.
+      # CI gate 1 — AI multi-agent review. --strict exits non-zero when a
+      # must_have contract criterion is FAIL or any finding is critical.
+      # continue-on-error keeps the pipeline going so build + deploy +
+      # verify still run and report; the final "Pipeline gate" step turns
+      # a failed review into a red check.
       - name: AI review
+        id: ai_review
+        continue-on-error: true
         working-directory: ${{ env.AI_TOOL_PATH }}
         run: |
           source venv/bin/activate
@@ -111,8 +136,11 @@ jobs:
 
       # CI gate 2 — external e2e tests. The catalog dedups against
       # already-generated tests, so this only ever costs LLM tokens for
-      # APIs touched by the diff that aren't covered yet.
+      # APIs touched by the diff that aren't covered yet. continue-on-error
+      # for the same reason as the review step — see "Pipeline gate" below.
       - name: AI verify (generate + run)
+        id: ai_verify
+        continue-on-error: true
         working-directory: ${{ env.AI_TOOL_PATH }}
         run: |
           source venv/bin/activate
@@ -128,10 +156,29 @@ jobs:
           # Belt-and-suspenders for the Maven wrapper child process.
           pkill -f 'spring-boot:run' || true
 
+      # The review + verify steps run continue-on-error, so every stage
+      # above completes and reports even when a gate trips. This final
+      # step is the single place the job goes red — after the whole
+      # pipeline has run, not in the middle of it.
+      - name: Pipeline gate
+        if: always()
+        run: |
+          echo "AI review : ${{ steps.ai_review.outcome }}"
+          echo "AI verify : ${{ steps.ai_verify.outcome }}"
+          failed=0
+          if [ "${{ steps.ai_review.outcome }}" = "failure" ]; then
+            echo "::error::AI review gate failed (strict: must_have FAIL or critical finding)"
+            failed=1
+          fi
+          if [ "${{ steps.ai_verify.outcome }}" = "failure" ]; then
+            echo "::error::AI verify gate failed (external e2e test failures)"
+            failed=1
+          fi
+          exit $failed
+
   # ---------------------------------------------------------------------------
   # AI-apply job: on PR comments containing "/apply", let the AI commit the
-  # suggested fix to the PR branch. Phase 2 wires the `apply` command — the
-  # YAML is here now so the workflow surface is one commit, not two.
+  # chosen review fixes to the PR branch.
   # ---------------------------------------------------------------------------
   ai-apply:
     if: |
@@ -149,6 +196,23 @@ jobs:
           # the actual head branch checked out at the head SHA.
           fetch-depth: 0
           ref: refs/pull/${{ github.event.issue.number }}/head
+
+      - name: Prepare AI tool
+        run: |
+          set -e
+          AI_TOOL_PATH="$HOME/ai-engineering-workspace"
+          AI_TOOL_REPO="https://github.com/jessejia1991/ai-engineering-workspace.git"
+          if [ -d "$AI_TOOL_PATH/.git" ]; then
+            # Force-sync to origin. The clone is a CI artifact — local
+            # runtime writes must never block or diverge from the remote.
+            git -C "$AI_TOOL_PATH" fetch --quiet origin
+            git -C "$AI_TOOL_PATH" reset --hard --quiet origin/main
+          else
+            git clone "$AI_TOOL_REPO" "$AI_TOOL_PATH"
+          fi
+          [ -d "$AI_TOOL_PATH/venv" ] || python3 -m venv "$AI_TOOL_PATH/venv"
+          "$AI_TOOL_PATH/venv/bin/pip" install -q -r "$AI_TOOL_PATH/requirements.txt"
+          echo "AI_TOOL_PATH=$AI_TOOL_PATH" >> "$GITHUB_ENV"
 
       - name: AI apply
         working-directory: ${{ env.AI_TOOL_PATH }}
