@@ -4,13 +4,7 @@ __pycache__/
 *.pyc
 *.db
 reports/
-.ai-workspace/reflection-log.json
-.ai-workspace/chroma_db/
-.ai-workspace/repo-context.json
-.ai-workspace/task-memory/
-
-# Generated tests are kept under .ai-workspace/generated-tests/<repo_id>/.
-# We DO track these — they ship as reproducible demo artifacts so a
-# reviewer cloning the repo sees an example of what `verify generate`
-# produces against petclinic. New entries are added by `verify generate`
-# and should be committed alongside other source changes.
+# .ai-workspace/ is per-project runtime state the tool produces when it is
+# USED on a project (scan profile, ChromaDB memory, generated tests, logs).
+# It is not part of the tool's source — never tracked, at any depth.
+.ai-workspace/
