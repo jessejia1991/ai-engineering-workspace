@@ -225,13 +225,16 @@ def add_test_to_catalog(
     file_path: str,
     repo_id: str,
     generated_at: str | None = None,
+    source_files: list[str] | None = None,
 ) -> None:
     """
     Register a generated test. document = "Tests <description>" so semantic
     search by intent ("notes field validation") finds it.
     apis_covered comes in as ["POST /api/pets", "GET /api/pets/{id}"] —
     flattened to a comma-separated string because ChromaDB metadata is
-    primitive-typed.
+    primitive-typed. source_files is the repo-relative controller file(s)
+    that implement those APIs — it powers file→test impact lookup
+    (query_tests_by_files) and controller-level dedup in `verify generate`.
     """
     coll = get_test_catalog_collection()
     now = _now_ts()
@@ -242,6 +245,7 @@ def add_test_to_catalog(
             "repo_id":       repo_id,
             "test_id":       test_id,
             "apis_covered":  ",".join(apis_covered) if apis_covered else "",
+            "source_files":  ",".join(source_files) if source_files else "",
             "file_path":     file_path,
             "generated_at":  generated_at or datetime.now().isoformat(),
             "last_run_at":   "",
@@ -309,6 +313,34 @@ def query_tests_by_apis(apis: list[str], repo_id: str) -> list[dict]:
     return hits
 
 
+def path_overlap(a: str, b: str) -> bool:
+    """True when two repo-relative paths point at the same file even if one
+    side carries a different prefix depth (basename-suffix match)."""
+    a, b = a.strip().strip("/"), b.strip().strip("/")
+    if not a or not b:
+        return False
+    return a == b or a.endswith("/" + b) or b.endswith("/" + a)
+
+
+def query_tests_by_files(changed_files: list[str], repo_id: str) -> list[dict]:
+    """
+    File→test impact selection: given repo-relative changed file paths,
+    return catalog entries whose `source_files` overlaps. This is the
+    direct "which tests verify this file" lookup — powers `verify impact`
+    and `verify run --diff`.
+    """
+    if not changed_files:
+        return []
+    changed = [c.strip() for c in changed_files if c.strip()]
+    hits = []
+    for e in list_catalog_entries(repo_id=repo_id):
+        src_raw = (e.get("metadata") or {}).get("source_files", "")
+        srcs = [s.strip() for s in src_raw.split(",") if s.strip()]
+        if any(path_overlap(s, c) for s in srcs for c in changed):
+            hits.append(e)
+    return hits
+
+
 def query_tests_by_description(query_text: str, repo_id: str,
                                top_k: int = 5) -> list[dict]:
     """Semantic search over test_catalog documents. Strict repo-isolation."""
@@ -335,6 +367,23 @@ def delete_test_from_catalog(test_id: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def clear_catalog(repo_id: str) -> int:
+    """
+    Delete every test_catalog entry for a repo. Returns the count removed.
+    Used by `verify catalog clear` to wipe accumulated generations before a
+    clean re-generate (stale / duplicate-coverage test files build up
+    across runs otherwise).
+    """
+    try:
+        coll = get_test_catalog_collection()
+        ids = [e["id"] for e in list_catalog_entries(repo_id=repo_id) if e.get("id")]
+        if ids:
+            coll.delete(ids=ids)
+        return len(ids)
+    except Exception:
+        return 0
 
 
 # ===================================================================

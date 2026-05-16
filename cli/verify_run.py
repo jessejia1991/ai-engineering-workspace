@@ -31,8 +31,8 @@ from rich import box
 from database import init_db, get_active_repo
 from scanner.repo_scanner import load_profile, get_changed_files
 from memory.vector_store import (
-    list_catalog_entries, query_tests_by_apis, query_tests_by_description,
-    update_test_run_status, add_correction,
+    list_catalog_entries, query_tests_by_files, query_tests_by_description,
+    update_test_run_status, add_correction, path_overlap,
 )
 from agents.llm_client import client as llm_client, set_trace_context
 
@@ -96,25 +96,24 @@ async def run_verify_run(rest: list[str]) -> int:
 
     selected_files: list[Path] = []
     if use_diff and not select_all:
-        apis_in_diff = _apis_for_diff(profile)
-        if not apis_in_diff:
-            console.print(
-                "[yellow]No APIs detected as impacted by current diff — "
-                "falling back to running all generated tests.[/yellow]"
-            )
-            selected_files = sorted(repo_dir.glob("test_*.py"))
-        else:
-            hits = query_tests_by_apis(apis_in_diff, repo_id)
-            wanted = {(h.get("metadata") or {}).get("file_path", "") for h in hits}
-            wanted = {WORKSPACE_ROOT / w for w in wanted if w}
+        # File→test impact: changed files -> the controller's catalog entry
+        # -> its test file. One hop, via the source_files index.
+        try:
+            changed = get_changed_files(profile.get("repo_path", ""))
+        except Exception:
+            changed = []
+        hits = query_tests_by_files(changed, repo_id) if changed else []
+        if hits:
+            wanted = {WORKSPACE_ROOT / (h.get("metadata") or {}).get("file_path", "")
+                      for h in hits}
             selected_files = [p for p in sorted(repo_dir.glob("test_*.py"))
                               if p in wanted]
-            if not selected_files:
-                console.print(
-                    "[yellow]Catalog had no test covering the diff APIs — "
-                    "running all generated tests instead.[/yellow]"
-                )
-                selected_files = sorted(repo_dir.glob("test_*.py"))
+        if not selected_files:
+            console.print(
+                "[yellow]No catalog test maps to the changed files — "
+                "running all generated tests.[/yellow]"
+            )
+            selected_files = sorted(repo_dir.glob("test_*.py"))
     else:
         selected_files = sorted(repo_dir.glob("test_*.py"))
 
@@ -201,27 +200,6 @@ async def run_verify_run(rest: list[str]) -> int:
 
     # Exit code: 0 if all green, 1 if any test failed or errored.
     return 1 if (n_fail or n_err) else 0
-
-
-def _apis_for_diff(profile: dict) -> list[str]:
-    """Map diff-changed files to APIs they own."""
-    apis = profile.get("apis") or []
-    try:
-        changed = get_changed_files(profile.get("repo_path", ""))
-    except Exception:
-        return []
-    if not changed:
-        return []
-    chf_lower = " ".join(changed).lower()
-    out = []
-    for a in apis:
-        handler = (a.get("handler") or "").lower()
-        file_   = (a.get("file") or "").lower()
-        handler_class = handler.split(".")[0] if "." in handler else handler
-        if (file_ and any(file_ in cf.lower() for cf in changed)) or \
-           (handler_class and handler_class in chf_lower):
-            out.append(f"{a['method']} {a['path']}")
-    return out
 
 
 # ---------- pytest output parsing ----------------------------------------
@@ -470,6 +448,7 @@ async def run_verify_list(rest: list[str]) -> None:
                   title=f"Test catalog · repo={repo_id}")
     table.add_column("Test ID",  style="cyan bold")
     table.add_column("Status",   style="white", justify="center")
+    table.add_column("Source file(s)", style="dim")
     table.add_column("APIs covered", style="dim")
     table.add_column("Description", style="white", overflow="fold")
     table.add_column("Last run",   style="dim", width=19)
@@ -484,14 +463,100 @@ async def run_verify_list(rest: list[str]) -> None:
             "UNKNOWN": "[dim]—[/dim]",
         }.get(status_raw, status_raw)
         last_run = (m.get("last_run_at") or "")[:19]
+        sources = ", ".join(
+            Path(s).name for s in (m.get("source_files", "") or "").split(",")
+            if s.strip()
+        ) or "—"
         table.add_row(
             e["id"],
             status,
+            sources,
             m.get("apis_covered", ""),
             e.get("document", "")[:80].replace("Tests ", ""),
             last_run,
         )
     console.print(table)
+
+
+# ---------- verify impact ------------------------------------------------
+
+async def run_verify_impact(rest: list[str]) -> None:
+    """
+    `verify impact <file>` — answer "if this file changes, what do I verify?":
+    the API endpoints implemented in the file, and the catalog tests that
+    cover them. A manual-inspection surface — the CI pipeline already does
+    this automatically via `verify run --diff` (same source_files index).
+    """
+    target = ""
+    repo_id: str | None = None
+    i = 0
+    while i < len(rest):
+        if rest[i] == "--repo" and i + 1 < len(rest):
+            repo_id = rest[i + 1]; i += 2
+        elif not rest[i].startswith("-") and not target:
+            target = rest[i]; i += 1
+        else:
+            i += 1
+    if not target:
+        console.print("[red]Usage: verify impact <file> [--repo X][/red]")
+        return
+
+    await init_db()
+    if not repo_id:
+        active = await get_active_repo()
+        if not active:
+            console.print("[red]No active repo and no --repo flag.[/red]")
+            return
+        repo_id = active["id"]
+
+    # Endpoints implemented in the file (from the scan profile).
+    try:
+        profile = load_profile()
+    except FileNotFoundError:
+        profile = {}
+    eps = [
+        a for a in (profile.get("apis") or [])
+        if path_overlap(a.get("source_file", "") or "", target)
+    ]
+    # Catalog tests whose source_files cover the file.
+    tests = query_tests_by_files([target], repo_id)
+
+    console.print(Panel.fit(
+        f"[bold]verify impact[/bold]  file={target}  repo={repo_id}",
+        border_style="blue",
+    ))
+
+    if eps:
+        t1 = Table(box=box.SIMPLE_HEAVY, show_header=True,
+                   title=f"Endpoints implemented here ({len(eps)})")
+        t1.add_column("Method", style="cyan", width=7)
+        t1.add_column("Path", style="white")
+        for a in sorted(eps, key=lambda x: (x.get("path", ""), x.get("method", ""))):
+            t1.add_row(a.get("method", ""), a.get("path", ""))
+        console.print(t1)
+    else:
+        console.print("[dim]No API endpoints map to this file.[/dim]")
+
+    if tests:
+        t2 = Table(box=box.SIMPLE_HEAVY, show_header=True,
+                   title=f"Tests to run when this file changes ({len(tests)})")
+        t2.add_column("Test ID", style="cyan bold")
+        t2.add_column("Status", justify="center", width=8)
+        t2.add_column("APIs covered", style="dim")
+        for e in tests:
+            m = e.get("metadata") or {}
+            t2.add_row(e["id"], m.get("last_status", "UNKNOWN"),
+                       m.get("apis_covered", ""))
+        console.print(t2)
+        console.print(
+            "\n[dim]CI runs exactly this set automatically — "
+            "`verify run --diff` selects it from the same index.[/dim]"
+        )
+    else:
+        console.print(
+            "[yellow]No catalog test covers this file.[/yellow] "
+            "[dim]Run `verify generate` to add coverage.[/dim]"
+        )
 
 
 # ---------- verify health-check -----------------------------------------
@@ -590,9 +655,51 @@ async def run_verify_health_check(rest: list[str]) -> int:
 
 # ---------- verify catalog search ---------------------------------------
 
+async def _catalog_clear(rest: list[str]) -> None:
+    """Wipe the active repo's generated test files + test_catalog entries —
+    a clean slate before re-generating (removes stale / duplicate-coverage
+    test files accumulated across runs)."""
+    import shutil
+    from memory.vector_store import clear_catalog
+
+    repo_id: str | None = None
+    i = 0
+    while i < len(rest):
+        if rest[i] == "--repo" and i + 1 < len(rest):
+            repo_id = rest[i + 1]; i += 2
+        else:
+            i += 1
+    if not repo_id:
+        await init_db()
+        active = await get_active_repo()
+        if not active:
+            console.print("[red]No active repo and no --repo flag.[/red]")
+            return
+        repo_id = active["id"]
+
+    n_entries = clear_catalog(repo_id)
+    repo_dir = GENERATED_TESTS_ROOT / repo_id
+    n_files = 0
+    if repo_dir.is_dir():
+        n_files = len(list(repo_dir.glob("test_*.py")))
+        shutil.rmtree(repo_dir)
+
+    console.print(
+        f"[green]✓ Catalog cleared for '{repo_id}'[/green]  "
+        f"[dim]({n_entries} catalog entr{'y' if n_entries == 1 else 'ies'} + "
+        f"{n_files} test file(s) removed)[/dim]"
+    )
+
+
 async def run_verify_catalog(rest: list[str]) -> None:
+    if rest and rest[0] == "clear":
+        await _catalog_clear(rest[1:])
+        return
     if not rest or rest[0] != "search":
-        console.print("[red]Usage: verify catalog search \"<query>\" [--repo X][/red]")
+        console.print(
+            "[red]Usage: verify catalog search \"<query>\" [--repo X]  |  "
+            "verify catalog clear [--repo X][/red]"
+        )
         return
     rest = rest[1:]
     if not rest:

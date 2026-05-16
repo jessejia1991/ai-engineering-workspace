@@ -18,10 +18,18 @@ Output shape: list of dicts:
     "method":  "GET" | "POST" | "PUT" | "DELETE" | "PATCH",
     "path":    "/api/pets/{id}/visits",
     "handler": "VisitController.findByPet",     # class.method or function name
-    "file":    "src/main/java/.../VisitController.java",
+    "file":    "src/main/java/.../VisitController.java",  # where DECLARED
     "line":    87,
-    "framework": "spring" | "express",
+    "framework": "spring" | "express" | "openapi",
+    "source_file": "src/.../VisitRestController.java",    # where IMPLEMENTED
+    "registered":  True,   # False = spec'd but no handler found in code
   }
+
+`source_file` + `registered` are filled by _annotate_impl: for an
+openapi-spec endpoint the spec only states the contract, so we locate
+the hand-written controller that implements it. An endpoint with no
+implementation (`registered: False`) is one the verify slice should not
+generate tests for.
 """
 
 from __future__ import annotations
@@ -252,7 +260,69 @@ def extract_apis(repo_root: str, files: list[str] | None = None) -> list[dict]:
             if ranks.get(api["framework"], 99) < ranks.get(seen[key]["framework"], 99):
                 seen[key] = api
 
-    return sorted(seen.values(), key=lambda a: (a["file"], a.get("line", 0), a["method"]))
+    finalized = list(seen.values())
+    # Resolve which controller actually implements each endpoint.
+    _annotate_impl(finalized, root)
+    return sorted(finalized, key=lambda a: (a["file"], a.get("line", 0), a["method"]))
+
+
+# ---------- endpoint → implementing-controller resolution --------------
+
+def _annotate_impl(apis: list[dict], root: Path) -> None:
+    """
+    Annotate every API dict in place with:
+      - source_file: repo-relative path of the controller that IMPLEMENTS
+                     the endpoint ("" if no implementation is found)
+      - registered:  True when an implementation was located, else False
+
+    For spring/express endpoints the declaring file IS the implementation,
+    so source_file = file. For openapi-spec endpoints (the codegen case)
+    the spec only states the contract — the handler lives in a hand-written
+    controller, located here with two signals so openapi-codegen apps
+    (operationId methods) and plain Spring apps (@*Mapping) are both
+    covered:
+      1. the endpoint's operationId appears as an identifier in a
+         @(Rest)Controller source file, or
+      2. a @*Mapping in such a file matches the endpoint's verb + path.
+    """
+    # Index @(Rest)Controller source files once (skip generated/build dirs).
+    controllers: list[tuple[str, str, set]] = []
+    for fp in _walk_targets(root):
+        if fp.suffix != ".java":
+            continue
+        if "target" in fp.parts or "build" in fp.parts:
+            continue
+        try:
+            text = fp.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        if not _SPRING_CONTROLLER_RE.search(text):
+            continue
+        rel = str(fp.relative_to(root))
+        verb_paths = {
+            (e["method"], (e["path"] or "/").rstrip("/") or "/")
+            for e in _extract_spring(fp, text, root)
+        }
+        controllers.append((rel, text, verb_paths))
+
+    for api in apis:
+        if api.get("framework") in ("spring", "express"):
+            api["source_file"] = api.get("file", "")
+            api["registered"] = True
+            continue
+        # openapi — resolve against the controller index
+        op = (api.get("handler") or "").strip()
+        if op == "<openapi>":
+            op = ""
+        op_re = re.compile(r"\b" + re.escape(op) + r"\b") if op else None
+        ep = (api.get("method", ""), (api.get("path") or "/").rstrip("/") or "/")
+        match = ""
+        for rel, text, verb_paths in controllers:
+            if (op_re and op_re.search(text)) or ep in verb_paths:
+                match = rel
+                break
+        api["source_file"] = match
+        api["registered"] = bool(match)
 
 
 def _walk_targets(root: Path):

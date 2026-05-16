@@ -476,7 +476,8 @@ _verify_subcmd_factory("generate",     "Generate Python e2e tests for detected A
 _verify_subcmd_factory("run",          "Run generated tests against $VERIFY_TARGET_URL. Exit 1 on test failure.")
 _verify_subcmd_factory("health-check", "Probe $VERIFY_TARGET_URL. Exit 0 if up, 1 if not.")
 _verify_subcmd_factory("list",         "List test catalog entries.")
-_verify_subcmd_factory("catalog",      "Catalog search subcommand. Usage: verify catalog search \"<query>\"")
+_verify_subcmd_factory("impact",       "Show endpoints + tests impacted by a changed file. Usage: verify impact <file>")
+_verify_subcmd_factory("catalog",      "Catalog search / clear. Usage: verify catalog search \"<query>\" | verify catalog clear")
 
 
 @cli.group(name="repo", help="Repo registry management.")
