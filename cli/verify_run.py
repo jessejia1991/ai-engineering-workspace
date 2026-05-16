@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import re
+import ast
 import json
 import uuid
 import subprocess
@@ -44,11 +45,184 @@ GENERATED_TESTS_ROOT = WORKSPACE_ROOT / ".ai-workspace" / "generated-tests"
 
 # ---------- verify run --------------------------------------------------
 
+def resolve_base_url(profile: dict) -> str:
+    """
+    The default verify target URL when neither --url nor $VERIFY_TARGET_URL
+    is given. Prefers the OpenAPI `servers[].url` from the scan profile
+    (made absolute against the detected port if it is a bare path), so the
+    context path / API prefix the user would otherwise hand-set is picked
+    up automatically. Falls back to http://localhost:<detected-port>.
+    """
+    port = (profile.get("runtime") or {}).get("port", 8080)
+    spec_url = (profile.get("api_base_url") or "").strip()
+    if spec_url.startswith(("http://", "https://")):
+        return spec_url
+    if spec_url.startswith("/"):
+        return f"http://localhost:{port}{spec_url.rstrip('/')}"
+    return f"http://localhost:{port}"
+
+
+def _run_pytest(selected_files: list[Path], url: str):
+    """Run pytest over `selected_files`. Returns (results, stdout), or an int
+    exit code on a fatal error (pytest missing / timeout)."""
+    env = os.environ.copy()
+    env["VERIFY_TARGET_URL"] = url
+    cmd = ["pytest", "-v", "--tb=short", "--no-header",
+           *[str(p) for p in selected_files]]
+    console.print(
+        f"  [dim]$ VERIFY_TARGET_URL={url} pytest "
+        f"{' '.join(p.name for p in selected_files)}[/dim]\n"
+    )
+    try:
+        proc = subprocess.run(
+            cmd, env=env, cwd=str(WORKSPACE_ROOT),
+            capture_output=True, text=True, timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        console.print("[red]pytest timed out after 180s[/red]")
+        return 1
+    except FileNotFoundError:
+        console.print(
+            "[red]pytest not found in PATH.[/red] "
+            "Install: [bold]pip install pytest requests[/bold]"
+        )
+        return 2
+    return _parse_pytest_output(proc.stdout), proc.stdout
+
+
+def _render_results(results: list[dict]) -> tuple[int, int, int]:
+    """Print the results table. Returns (n_pass, n_fail, n_err)."""
+    table = Table(box=box.SIMPLE_HEAVY, show_header=True, title="Test results")
+    table.add_column("Status", style="bold", width=8, justify="center")
+    table.add_column("Test", style="white")
+    table.add_column("Detail", style="dim")
+    n_pass = n_fail = n_err = 0
+    for r in results:
+        status = {
+            "PASSED":  "[green]✓ PASS[/green]",
+            "FAILED":  "[red]✗ FAIL[/red]",
+            "ERROR":   "[red]! ERR[/red]",
+            "SKIPPED": "[dim]- SKIP[/dim]",
+        }.get(r["status"], r["status"])
+        table.add_row(status, r["test"], r.get("detail", "")[:80])
+        if r["status"] == "PASSED":
+            n_pass += 1
+        elif r["status"] == "FAILED":
+            n_fail += 1
+        elif r["status"] == "ERROR":
+            n_err += 1
+    console.print(table)
+    console.print(
+        f"[bold]{n_pass} passed · {n_fail} failed · {n_err} errored[/bold]"
+    )
+    return n_pass, n_fail, n_err
+
+
+# ---------- auto-fix (self-heal) -----------------------------------------
+
+_FIX_PROMPT = """A generated pytest e2e-test file has failing tests caused by
+bugs in the TEST CODE itself (not the system under test). Fix the file.
+
+## Test file: {filename}
+```python
+{source}
+```
+
+## Failing tests in this file + diagnosis
+{failures_block}
+
+## Rules
+- Fix ONLY the diagnosed test-code bugs. Leave passing tests untouched.
+- Keep using the conftest fixtures (`base_url`, `ctx`, `register_cleanup`)
+  exactly as the file already uses them — the suite shares state via them.
+- Preserve the dependency contract: read deps from `ctx`, skip if absent,
+  store created ids in `ctx`, register cleanups, never delete a ctx-shared
+  resource inline.
+- Return the COMPLETE corrected file as raw Python. No prose, no fences.
+"""
+
+
+async def _llm_fix_test(file_abs: Path, file_label: str,
+                        failures: list[tuple]) -> str:
+    """LLM-patch a test file given its test-bug failures + analyses. Returns
+    the corrected file content (ast-validated), or '' if it can't."""
+    try:
+        source = file_abs.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+    lines = []
+    for f, a in failures:
+        lines.append(
+            f"- {f['test']}  [{a.get('category')}]\n"
+            f"  diagnosis: {a.get('reasoning', '')}\n"
+            f"  fix hint:  {a.get('fix_hint', '')}"
+        )
+    prompt = _FIX_PROMPT.format(
+        filename=file_label,
+        source=source[:24000],
+        failures_block="\n".join(lines),
+    )
+    set_trace_context(trace_id=f"verify-fix-{uuid.uuid4().hex[:8]}",
+                      agent_name="TestVerifier")
+    try:
+        resp = await llm_client.messages.create(
+            model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+            max_tokens=16000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = resp.content[0].text
+    except Exception as e:
+        console.print(f"  [red]✗ fix LLM call failed: {type(e).__name__}: {e}[/red]")
+        return ""
+    # Strip a stray markdown fence if the model added one.
+    if text.lstrip().startswith("```"):
+        body = text.split("```", 1)[1]
+        if "\n" in body and body.split("\n", 1)[0].strip().isalpha():
+            body = body.split("\n", 1)[1]
+        if "```" in body:
+            body = body.rsplit("```", 1)[0]
+        text = body
+    text = text.strip() + "\n"
+    try:
+        ast.parse(text)                      # never write a broken patch
+    except SyntaxError:
+        return ""
+    return text
+
+
+async def _autofix_files(fixable: list[tuple]) -> None:
+    """Group test-bug failures by file and LLM-patch each file in place."""
+    by_file: dict[str, list[tuple]] = {}
+    for f, a in fixable:
+        by_file.setdefault(f["file"], []).append((f, a))
+    for rel_path, items in by_file.items():
+        file_abs = WORKSPACE_ROOT / rel_path
+        label = Path(rel_path).name
+        fixed = await _llm_fix_test(file_abs, label, items)
+        if not fixed:
+            console.print(
+                f"  [yellow]⊘ {label}: could not produce a valid fix[/yellow]"
+            )
+            continue
+        file_abs.write_text(fixed, encoding="utf-8")
+        console.print(
+            f"  [green]✓ {label}: patched[/green] "
+            f"[dim]({len(items)} test-bug failure(s))[/dim]"
+        )
+
+
+# Auto-fix self-heal loop: at most this many fix-and-rerun rounds. The loop
+# also stops early when no test-bug failures remain or a round makes no
+# progress — so this cap is a backstop, not the usual exit.
+MAX_FIX_ROUNDS = 3
+
+
 async def run_verify_run(rest: list[str]) -> int:
     use_diff = False
     url: str | None = None
     do_analyze = True
     select_all = False
+    fix_mode = False
     i = 0
     while i < len(rest):
         a = rest[i]
@@ -58,6 +232,8 @@ async def run_verify_run(rest: list[str]) -> int:
             url = rest[i + 1]; i += 2
         elif a == "--no-analyze":
             do_analyze = False; i += 1
+        elif a == "--fix":
+            fix_mode = True; i += 1
         elif a == "--select" and i + 1 < len(rest):
             if rest[i + 1] == "all":
                 select_all = True
@@ -73,17 +249,15 @@ async def run_verify_run(rest: list[str]) -> int:
         return 2
     repo_id = active["id"]
 
-    # Resolve URL: --url > env > runtime.port default
+    # Resolve URL: --url > $VERIFY_TARGET_URL > OpenAPI servers.url > port
     try:
         profile = load_profile()
     except FileNotFoundError:
         profile = {}
-    runtime = profile.get("runtime") or {}
     if not url:
         url = os.environ.get("VERIFY_TARGET_URL")
     if not url:
-        port = runtime.get("port", 8080)
-        url = f"http://localhost:{port}"
+        url = resolve_base_url(profile)
 
     # Test selection
     repo_dir = GENERATED_TESTS_ROOT / repo_id
@@ -117,88 +291,92 @@ async def run_verify_run(rest: list[str]) -> int:
     else:
         selected_files = sorted(repo_dir.glob("test_*.py"))
 
+    # Order the files by entity topology so an upstream entity's tests run
+    # (and populate the shared ctx) before a downstream entity reads it.
+    # test_<entity>.py -> entity -> position in the topological order.
+    topo_order = ((profile.get("entity_topology") or {}).get("order")) or []
+
+    def _file_rank(p: Path) -> int:
+        ent = p.stem[5:] if p.stem.startswith("test_") else p.stem
+        return topo_order.index(ent) if ent in topo_order else len(topo_order)
+
+    selected_files = sorted(selected_files, key=_file_rank)
+
     console.print(Panel.fit(
         f"[bold]verify run[/bold]  "
         f"repo={repo_id} · url={url} · selected={len(selected_files)} test file(s)",
         border_style="blue",
     ))
 
-    # Build pytest command
-    env = os.environ.copy()
-    env["VERIFY_TARGET_URL"] = url
-    cmd = [
-        "pytest", "-v", "--tb=short",
-        "--no-header",
-        *[str(p) for p in selected_files],
-    ]
-    console.print(f"  [dim]$ VERIFY_TARGET_URL={url} pytest {' '.join(p.name for p in selected_files)}[/dim]\n")
+    # ---- run → analyze → (with --fix) auto-heal → rerun --------------------
+    round_no = 0
+    prev_fixable = None
+    results: list[dict] = []
 
-    try:
-        proc = subprocess.run(
-            cmd, env=env, cwd=str(WORKSPACE_ROOT),
-            capture_output=True, text=True, timeout=120,
-        )
-    except subprocess.TimeoutExpired:
-        console.print("[red]pytest timed out after 120s[/red]")
-        return 1
-    except FileNotFoundError:
+    while True:
+        ran = _run_pytest(selected_files, url)
+        if isinstance(ran, int):
+            return ran                       # pytest missing / timed out
+        results, stdout = ran
+        _render_results(results)
+
+        failures = [r for r in results if r["status"] in ("FAILED", "ERROR")]
+        analyses: dict[str, tuple] = {}       # test label -> (failure, analysis)
+        if failures and do_analyze:
+            console.print("\n[bold]Analyzing failures...[/bold]")
+            for f in failures:
+                a = await _analyze_failure(f, stdout, repo_id, url)
+                if a:
+                    analyses[f["test"]] = (f, a)
+        elif failures:
+            console.print(
+                "\n[dim]Pass --analyze to LLM-classify failures.[/dim]"
+            )
+
+        # Self-heal: only with --fix, only test-code bugs (never regression).
+        if not (fix_mode and failures and do_analyze):
+            break
+        fixable = [
+            (f, a) for (f, a) in analyses.values()
+            if a.get("category") in ("test-bug-script", "test-bug-payload")
+        ]
+        if not fixable:
+            console.print(
+                "[dim]auto-fix: nothing auto-fixable — remaining failures are "
+                "regression / flaky / config (left for human review).[/dim]"
+            )
+            break
+        if round_no >= MAX_FIX_ROUNDS:
+            console.print(
+                f"[yellow]auto-fix: hit the {MAX_FIX_ROUNDS}-round cap — "
+                f"stopping with {len(fixable)} test-bug failure(s) left.[/yellow]"
+            )
+            break
+        if prev_fixable is not None and len(fixable) >= prev_fixable:
+            console.print(
+                "[yellow]auto-fix: the last round did not reduce test-bug "
+                "failures — stopping (more rounds won't help).[/yellow]"
+            )
+            break
+        prev_fixable = len(fixable)
+        round_no += 1
         console.print(
-            "[red]pytest not found in PATH.[/red] "
-            "Install: [bold]pip install pytest requests[/bold]"
+            f"\n[bold magenta]── auto-fix round {round_no} ──[/bold magenta]  "
+            f"patching {len(fixable)} test-bug failure(s), then re-running"
         )
-        return 2
+        await _autofix_files(fixable)
+        # loop back: re-run pytest
 
-    stdout = proc.stdout
-    stderr = proc.stderr
-
-    results = _parse_pytest_output(stdout)
-
-    # Render results
-    table = Table(box=box.SIMPLE_HEAVY, show_header=True, title="Test results")
-    table.add_column("Status", style="bold", width=8, justify="center")
-    table.add_column("Test", style="white")
-    table.add_column("Detail", style="dim")
-    n_pass = n_fail = n_err = 0
-    for r in results:
-        status_color = {
-            "PASSED":  "[green]✓ PASS[/green]",
-            "FAILED":  "[red]✗ FAIL[/red]",
-            "ERROR":   "[red]! ERR[/red]",
-            "SKIPPED": "[dim]- SKIP[/dim]",
-        }.get(r["status"], r["status"])
-        table.add_row(status_color, r["test"], r.get("detail", "")[:80])
-        if r["status"] == "PASSED":
-            n_pass += 1
-        elif r["status"] == "FAILED":
-            n_fail += 1
-        elif r["status"] == "ERROR":
-            n_err += 1
-    console.print(table)
-    console.print(
-        f"[bold]{n_pass} passed · {n_fail} failed · {n_err} errored[/bold]"
-    )
-
-    # Update catalog last_run for each test FILE (one file may have many
-    # test functions; we roll up to file-level status).
+    # Catalog last_run rollup reflects the FINAL run.
     file_status = _rollup_file_status(results, selected_files)
     for fp, status in file_status.items():
         test_id = _test_id_from_file(fp, repo_id)
         if test_id:
             update_test_run_status(test_id, status)
 
-    # Failure analysis loop
-    failures = [r for r in results if r["status"] in ("FAILED", "ERROR")]
-    if failures and do_analyze:
-        console.print("\n[bold]Analyzing failures...[/bold]")
-        for f in failures:
-            await _analyze_failure(f, stdout, repo_id, url)
-    elif failures:
-        console.print(
-            "\n[dim]Pass --analyze to LLM-classify failures and write "
-            "lessons to corrections_memory.[/dim]"
-        )
-
     # Exit code: 0 if all green, 1 if any test failed or errored.
+    n_fail = sum(1 for r in results if r["status"] == "FAILED")
+    n_err = sum(1 for r in results if r["status"] == "ERROR")
     return 1 if (n_fail or n_err) else 0
 
 
@@ -307,7 +485,7 @@ Classify this failure. Pick exactly ONE category:
 {{
   "category":     "test-bug-script | test-bug-payload | test-bug-config | regression | flaky",
   "reasoning":    "one to three sentences explaining the classification with evidence from the trace",
-  "lesson":       "if category is test-bug-*, a single short sentence stating the rule future test generations should follow. Empty string for regression/flaky.",
+  "lesson":       "if category is test-bug-*, a single short sentence stating a TRANSFERABLE rule — a general principle that applies to ANY REST API, NOT specific to this project's endpoint or field names. Good: 'a reference field typed as a nested DTO is a JSON object, not a scalar id'. Bad: 'petclinic pets use type not typeId'. If the cause is irreducibly specific to this one project and would not help generate tests for a different API, return an empty string. Empty for regression/flaky.",
   "fix_hint":     "if category is test-bug-*, a concrete change to the test code. If regression, what to look at in the codebase. Empty for flaky."
 }}
 
@@ -335,23 +513,32 @@ async def _analyze_failure(failure: dict, full_stdout: str, repo_id: str, url: s
     trace_id = f"verify-analyze-{uuid.uuid4().hex[:8]}"
     set_trace_context(trace_id=trace_id, agent_name="FailureAnalyzer")
 
-    try:
-        response = await llm_client.messages.create(
-            model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
-            max_tokens=600,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = response.content[0].text.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```", 1)[1]
-            if raw.lower().startswith("json"):
-                raw = raw[4:]
-            if "```" in raw:
-                raw = raw.split("```", 1)[0]
-        data = json.loads(raw)
-    except Exception as e:
+    # The analyzer LLM call occasionally returns an empty / non-JSON body
+    # (transient). Retry once before giving up, and fail quietly.
+    data = None
+    for _attempt in (1, 2):
+        try:
+            response = await llm_client.messages.create(
+                model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+                max_tokens=1000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = (response.content[0].text or "").strip()
+            if raw.startswith("```"):
+                raw = raw.split("```", 1)[1]
+                if raw.lower().startswith("json"):
+                    raw = raw[4:]
+                if "```" in raw:
+                    raw = raw.split("```", 1)[0]
+            if raw.strip():
+                data = json.loads(raw)
+                break
+        except Exception:
+            data = None  # fall through to a retry, then give up
+    if data is None:
         console.print(
-            f"  [yellow]⚠ Failure analysis failed: {type(e).__name__}: {e}[/yellow]"
+            f"  [yellow]⚠ Failure analysis inconclusive for {failure['test']} "
+            f"— LLM gave no parseable verdict, skipped[/yellow]"
         )
         return
 
@@ -402,6 +589,9 @@ async def _analyze_failure(failure: dict, full_stdout: str, repo_id: str, url: s
             "  [dim]Config issue — not saving as generation lesson "
             "(env, not test-code).[/dim]"
         )
+
+    # Returned so the --fix self-heal loop can decide what is auto-fixable.
+    return data
 
 
 def _extract_trace_for_test(stdout: str, test_label: str) -> str:
@@ -598,10 +788,7 @@ async def run_verify_health_check(rest: list[str]) -> int:
     runtime = profile.get("runtime") or {}
 
     if not url:
-        base = os.environ.get("VERIFY_TARGET_URL")
-        if not base:
-            port = runtime.get("port", 8080)
-            base = f"http://localhost:{port}"
+        base = os.environ.get("VERIFY_TARGET_URL") or resolve_base_url(profile)
         health = runtime.get("health_endpoint")
         if health:
             # If health is like "/actuator/health" or "/api/health", join

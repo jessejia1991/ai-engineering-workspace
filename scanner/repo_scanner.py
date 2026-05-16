@@ -264,14 +264,27 @@ def scan(repo_root: str = None) -> dict:
     except Exception:
         runtime = {}
     try:
-        from scanner.api_extractor import extract_apis
+        from scanner.api_extractor import (
+            extract_apis, extract_api_schemas, extract_api_base_url,
+            build_entity_topology,
+        )
         # Limit extraction to backend files — controllers don't live in tests
         # or build artifacts. Frontend files (Express) are inspected too if
         # they match the pattern.
         candidate_files = classification["backend"] + classification["frontend"]
         apis = extract_apis(repo_root, files=candidate_files)
+        # OpenAPI component schemas — fed into verify test generation so
+        # request payloads use exact DTO field shapes.
+        api_schemas = extract_api_schemas(repo_root)
+        # OpenAPI servers[].url — the verify slice's default target URL.
+        api_base_url = extract_api_base_url(repo_root)
+        # Entity dependency DAG — drives dependency-ordered test gen + run.
+        entity_topology = build_entity_topology(apis, api_schemas)
     except Exception:
         apis = []
+        api_schemas = {}
+        api_base_url = ""
+        entity_topology = {"entities": {}, "order": []}
 
     # 5b. Health-check endpoint detection. The verify pipeline + the
     # ArchitectureAgent both consume this: verify uses it for the CD-gate
@@ -301,6 +314,9 @@ def scan(repo_root: str = None) -> dict:
         # Verify slice: how to build/run/test + what APIs exist
         "runtime": runtime,
         "apis":    apis,
+        "api_schemas": api_schemas,
+        "api_base_url": api_base_url,
+        "entity_topology": entity_topology,
 
         "scanned_at": datetime.now().isoformat()
     }
