@@ -4,7 +4,10 @@ import uuid
 import os
 from datetime import datetime
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace.db")
+# State lives under ~/.ai-workspace (see paths.py), not inside the clone,
+# so a dev checkout and the CI checkout share one DB.
+from paths import DB_PATH as _DB_PATH
+DB_PATH = str(_DB_PATH)
 
 
 async def init_db():

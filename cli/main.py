@@ -238,7 +238,8 @@ async def _cmd_scan():
         console.print(f"\n[bold]Runtime:[/bold] {runtime_summary(runtime)}")
         console.print(f"[bold]APIs:[/bold]    {apis_summary(apis)}")
 
-    console.print(f"\n[green]✓ Profile saved to .ai-workspace/repo-context.json[/green]")
+    from scanner.repo_scanner import CONTEXT_FILE
+    console.print(f"\n[green]✓ Profile saved to {CONTEXT_FILE}[/green]")
     console.print(f"[dim]Scanned at: {profile['scanned_at']}[/dim]\n")
 
 

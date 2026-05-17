@@ -51,8 +51,9 @@ from agents.llm_client import client as llm_client, set_trace_context
 console = Console()
 
 
-WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
-GENERATED_TESTS_ROOT = WORKSPACE_ROOT / ".ai-workspace" / "generated-tests"
+# Generated tests live under ~/.ai-workspace (see paths.py), shared across
+# every clone of the tool — not inside this checkout.
+from paths import GENERATED_TESTS_DIR as GENERATED_TESTS_ROOT
 
 
 # ---------- dispatcher --------------------------------------------------
@@ -622,7 +623,7 @@ async def _verify_generate(rest: list[str]) -> None:
                 test_id=test_id,
                 description=description,
                 apis_covered=apis_covered,
-                file_path=str(out_path.relative_to(WORKSPACE_ROOT)),
+                file_path=filename,
                 repo_id=repo_id,
                 source_files=[source_file],
             )
@@ -642,7 +643,7 @@ async def _verify_generate(rest: list[str]) -> None:
         return
 
     table = Table(box=box.SIMPLE_HEAVY, show_header=True,
-                  title=f"Generated {len(written)} test file(s) → {out_dir.relative_to(WORKSPACE_ROOT)}")
+                  title=f"Generated {len(written)} test file(s) → {out_dir}")
     table.add_column("File", style="cyan bold")
     table.add_column("Controller", style="dim")
     table.add_column("Endpoints", style="white", justify="right")

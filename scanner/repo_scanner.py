@@ -11,15 +11,11 @@ DEFAULT_REPO_PATH = os.environ.get("PETCLINIC_REPO_PATH") or os.path.join(
     "spring-petclinic-reactjs"
 )
 
-CONTEXT_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..", ".ai-workspace", "repo-context.json"
-)
-
-CORRECTIONS_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..", ".ai-workspace", "corrections.json"
-)
+# Scan profile + corrections live under ~/.ai-workspace (see paths.py),
+# not inside the clone — shared by every checkout run by the same user.
+from paths import PROFILE_FILE as _PROFILE_FILE, CORRECTIONS_FILE as _CORRECTIONS_FILE
+CONTEXT_FILE = str(_PROFILE_FILE)
+CORRECTIONS_FILE = str(_CORRECTIONS_FILE)
 
 SKIP_DIRS = {
     ".git", "node_modules", "target", "build", "dist",

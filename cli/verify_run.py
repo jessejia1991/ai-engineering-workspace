@@ -39,8 +39,9 @@ from agents.llm_client import client as llm_client, set_trace_context
 
 console = Console()
 
-WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
-GENERATED_TESTS_ROOT = WORKSPACE_ROOT / ".ai-workspace" / "generated-tests"
+# Generated tests live under ~/.ai-workspace (see paths.py), shared across
+# every clone of the tool — not inside this checkout.
+from paths import GENERATED_TESTS_DIR as GENERATED_TESTS_ROOT
 
 
 # ---------- verify run --------------------------------------------------
@@ -62,20 +63,22 @@ def resolve_base_url(profile: dict) -> str:
     return f"http://localhost:{port}"
 
 
-def _run_pytest(selected_files: list[Path], url: str):
-    """Run pytest over `selected_files`. Returns (results, stdout), or an int
-    exit code on a fatal error (pytest missing / timeout)."""
+def _run_pytest(selected_files: list[Path], url: str, repo_dir: Path):
+    """Run pytest over `selected_files`, from `repo_dir`. Returns
+    (results, stdout), or an int exit code on a fatal error."""
     env = os.environ.copy()
     env["VERIFY_TARGET_URL"] = url
+    # Run from the test dir with bare filenames so pytest reports plain
+    # `test_x.py::test_y` — deterministic wherever the state dir lives.
     cmd = ["pytest", "-v", "--tb=short", "--no-header",
-           *[str(p) for p in selected_files]]
+           *[p.name for p in selected_files]]
     console.print(
         f"  [dim]$ VERIFY_TARGET_URL={url} pytest "
         f"{' '.join(p.name for p in selected_files)}[/dim]\n"
     )
     try:
         proc = subprocess.run(
-            cmd, env=env, cwd=str(WORKSPACE_ROOT),
+            cmd, env=env, cwd=str(repo_dir),
             capture_output=True, text=True, timeout=180,
         )
     except subprocess.TimeoutExpired:
@@ -190,14 +193,15 @@ async def _llm_fix_test(file_abs: Path, file_label: str,
     return text
 
 
-async def _autofix_files(fixable: list[tuple]) -> None:
+async def _autofix_files(fixable: list[tuple], repo_id: str) -> None:
     """Group test-bug failures by file and LLM-patch each file in place."""
+    repo_dir = GENERATED_TESTS_ROOT / repo_id
     by_file: dict[str, list[tuple]] = {}
     for f, a in fixable:
         by_file.setdefault(f["file"], []).append((f, a))
-    for rel_path, items in by_file.items():
-        file_abs = WORKSPACE_ROOT / rel_path
-        label = Path(rel_path).name
+    for fname, items in by_file.items():
+        file_abs = repo_dir / Path(fname).name
+        label = Path(fname).name
         fixed = await _llm_fix_test(file_abs, label, items)
         if not fixed:
             console.print(
@@ -263,7 +267,7 @@ async def run_verify_run(rest: list[str]) -> int:
     repo_dir = GENERATED_TESTS_ROOT / repo_id
     if not repo_dir.is_dir() or not any(repo_dir.glob("test_*.py")):
         console.print(
-            f"[red]No generated tests under {repo_dir.relative_to(WORKSPACE_ROOT)}.[/red] "
+            f"[red]No generated tests under {repo_dir}.[/red] "
             f"Run [bold]verify generate[/bold] first."
         )
         return 2
@@ -278,10 +282,10 @@ async def run_verify_run(rest: list[str]) -> int:
             changed = []
         hits = query_tests_by_files(changed, repo_id) if changed else []
         if hits:
-            wanted = {WORKSPACE_ROOT / (h.get("metadata") or {}).get("file_path", "")
+            wanted = {(h.get("metadata") or {}).get("file_path", "")
                       for h in hits}
             selected_files = [p for p in sorted(repo_dir.glob("test_*.py"))
-                              if p in wanted]
+                              if p.name in wanted]
         if not selected_files:
             console.print(
                 "[yellow]No catalog test maps to the changed files — "
@@ -314,7 +318,7 @@ async def run_verify_run(rest: list[str]) -> int:
     results: list[dict] = []
 
     while True:
-        ran = _run_pytest(selected_files, url)
+        ran = _run_pytest(selected_files, url, repo_dir)
         if isinstance(ran, int):
             return ran                       # pytest missing / timed out
         results, stdout = ran
@@ -364,7 +368,7 @@ async def run_verify_run(rest: list[str]) -> int:
             f"\n[bold magenta]── auto-fix round {round_no} ──[/bold magenta]  "
             f"patching {len(fixable)} test-bug failure(s), then re-running"
         )
-        await _autofix_files(fixable)
+        await _autofix_files(fixable, repo_id)
         # loop back: re-run pytest
 
     # Catalog last_run rollup reflects the FINAL run.
@@ -416,8 +420,7 @@ def _rollup_file_status(results: list[dict], files: list[Path]) -> dict[Path, st
         by_file.setdefault(r["file"], []).append(r["status"])
     out: dict[Path, str] = {}
     for f in files:
-        rel = str(f.relative_to(WORKSPACE_ROOT))
-        statuses = by_file.get(rel, [])
+        statuses = by_file.get(f.name, [])
         if not statuses:
             out[f] = "UNKNOWN"
         elif "ERROR" in statuses:
@@ -430,8 +433,8 @@ def _rollup_file_status(results: list[dict], files: list[Path]) -> dict[Path, st
 
 
 def _test_id_from_file(fp: Path, repo_id: str) -> str | None:
-    """Reverse-lookup catalog entry by file path."""
-    target = str(fp.relative_to(WORKSPACE_ROOT))
+    """Reverse-lookup catalog entry by file name."""
+    target = fp.name
     for e in list_catalog_entries(repo_id=repo_id):
         if (e.get("metadata") or {}).get("file_path") == target:
             return e["id"]
@@ -496,7 +499,7 @@ No prose, no fences. Just the JSON.
 async def _analyze_failure(failure: dict, full_stdout: str, repo_id: str, url: str) -> None:
     """One LLM call per failed test. Writes lesson to corrections_memory if
     test-bug-*. Surfaces regression for the human."""
-    file_path = WORKSPACE_ROOT / failure["file"]
+    file_path = (GENERATED_TESTS_ROOT / repo_id / Path(failure["file"]).name)
     try:
         source = file_path.read_text(encoding="utf-8", errors="ignore")[:4000]
     except Exception:

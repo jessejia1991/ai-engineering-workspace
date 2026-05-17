@@ -29,10 +29,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-CHROMA_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    ".ai-workspace", "chroma_db"
-)
+# ChromaDB lives under ~/.ai-workspace (see paths.py) — shared across clones.
+from paths import CHROMA_DIR as _CHROMA_DIR
+CHROMA_PATH = str(_CHROMA_DIR)
 
 _client = None
 _findings_collection = None
